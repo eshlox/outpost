@@ -1,0 +1,27 @@
+# Machine-local git identity (+ optional SSH commit signing).
+#
+# Copy this to local.gitconfig and fill in your details:
+#   cp ~/.config/git/local.gitconfig.example ~/.config/git/local.gitconfig
+# (.gitconfig already `[include]`s local.gitconfig if it exists.)
+#
+# Inside the box, signing happens through your FORWARDED ssh agent (ssh -A), so the
+# private key never enters the container. On macOS, Secretive gives you a Touch-ID
+# gated key in the Secure Enclave; any ssh-agent key works. See docs/git-and-ssh.md.
+
+[user]
+	name = Your Name
+	email = you@example.com
+	# Your PUBLIC signing key (safe to commit). Only needed if you enable signing below.
+	# signingkey = key::ssh-ed25519 AAAA...your-public-key... you@example.com
+
+# Uncomment to turn on SSH commit/tag signing with the key above. allowedSignersFile
+# lets `git log --show-signature` verify locally. For GitHub's "Verified" badge, add
+# the same public key under Settings -> SSH and GPG keys -> Signing keys.
+# [gpg]
+# 	format = ssh
+# [gpg "ssh"]
+# 	allowedSignersFile = ~/.ssh/allowed_signers
+# [commit]
+# 	gpgsign = true
+# [tag]
+# 	gpgsign = true

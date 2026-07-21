@@ -1,0 +1,17 @@
+# Egress allowlist for the egress-proxy sidecar. With `FilterDefaultDeny On` in
+# tinyproxy.conf, ONLY hosts matching one of these POSIX-extended regexes are allowed;
+# every other destination is refused. Matching is against the request's hostname.
+#
+# Patterns anchor on a dot-or-start prefix and end-of-string so `evilgithub.com` does
+# NOT match `github.com`. Add the exact domains YOUR toolchain needs and no more.
+
+# GitHub (git over HTTPS, API, releases, raw content)
+(^|\.)github\.com$
+(^|\.)githubusercontent\.com$
+
+# npm registry
+^registry\.npmjs\.org$
+
+# PyPI (index + package downloads)
+(^|\.)pypi\.org$
+(^|\.)pythonhosted\.org$

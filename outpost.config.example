@@ -1,0 +1,55 @@
+# Example outpost config. Copy to ~/.config/outpost/config (or set $OUTPOST_CONFIG).
+# Plain shell: KEY=value / export. All values are optional - the defaults work.
+# This file is the complete catalog of OUTPOST_* knobs; see docs/concepts/configuration.
+
+# --- paths --------------------------------------------------------------------
+# Where your project configs live (your own git repo):
+# OUTPOST_PROJECTS_DIR="$HOME/outpost-projects"
+
+# Bake your OWN dotfiles into the base image instead of the shipped defaults:
+# OUTPOST_DOTFILES_DIR="$HOME/dotfiles/home"
+
+# Templates dir for `outpost projects new` (defaults to the tool's templates/):
+# OUTPOST_TEMPLATES_DIR="$HOME/outpost/templates"
+
+# Per-UID state dir for the agent-bridge socket. Defaults to $XDG_RUNTIME_DIR/outpost,
+# falling back to /tmp/outpost-<uid>. Keep it short (unix-socket path limit) and off
+# age-cleaned /tmp:
+# OUTPOST_STATE_DIR="$XDG_RUNTIME_DIR/outpost"
+
+# --- engine / editor ----------------------------------------------------------
+# Container engine (docker by default; podman is untested - see configuration docs):
+# OUTPOST_ENGINE="docker"
+
+# Editor for `outpost projects edit` (runs on the host). Falls back to hx/nvim/vim/vi/nano:
+# export EDITOR=hx
+
+# ~/.ssh/config host alias, used only for the copy-pasteable ssh -A / ssh -L hints
+# (`outpost ports`, the missing-agent error). Default 'dev-box':
+# OUTPOST_SSH_HOST="dev-box"
+
+# tmux session name used by `outpost dash` (default 'boxes'):
+# OUTPOST_DASH_SESSION="boxes"
+
+# --- base image ---------------------------------------------------------------
+# Base-image timezone (applied on `outpost base`):
+# OUTPOST_TZ="UTC"
+
+# --- per-container resources / hardening --------------------------------------
+# Opt-in resource caps:
+# OUTPOST_MEMORY="4g"
+# OUTPOST_CPUS="4"
+# Fork-bomb guard (default 4096; rarely needs changing):
+# OUTPOST_PIDS_LIMIT="4096"
+# Raise /dev/shm (default 64MB) for headless-browser tests (Playwright/Puppeteer):
+# OUTPOST_SHM_SIZE="1g"
+# Read-only rootfs (named volumes stay writable; /tmp and /run become tmpfs). Extra
+# hardening for untrusted deps/agents; opt-in so nothing breaks by default:
+# OUTPOST_READONLY=1
+
+# --- services / git -----------------------------------------------------------
+# Skip the compose safety lint for `outpost up` (you accept the risk; not recommended):
+# OUTPOST_ALLOW_UNSAFE_COMPOSE=1
+
+# Auto-commit the projects repo on `projects new`/`rm` (otherwise only on `projects sync`):
+# OUTPOST_AUTO_COMMIT=1

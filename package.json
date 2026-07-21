@@ -1,0 +1,20 @@
+{
+  "name": "outpost",
+  "version": "0.1.0",
+  "private": true,
+  "description": "One hardened Docker container per project on a remote host, driven from your terminal.",
+  "type": "module",
+  "packageManager": "pnpm@11.15.1",
+  "scripts": {
+    "lint": "shellcheck -S warning bin/outpost install.sh shared/bootstrap-user.sh shared/sshd.sh tests/smoke.sh tests/mock-docker",
+    "test": "bash tests/smoke.sh",
+    "docs:dev": "pnpm -C docs run dev",
+    "docs:build": "pnpm -C docs run build",
+    "changeset": "changeset",
+    "version:packages": "changeset version && node scripts/sync-version.mjs",
+    "release": "changeset tag"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.27.9"
+  }
+}

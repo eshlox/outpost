@@ -1,0 +1,11 @@
+# Safe defaults: Codex asks for approval and runs in a workspace sandbox. The outpost
+# container is itself a hardened isolation boundary, so you CAN run Codex fully
+# autonomous in it - see the "Running agents autonomously" guide for the one-liner.
+# Off by default so autonomy is a conscious choice on someone else's machine.
+approval_policy = "untrusted"
+sandbox_mode    = "workspace-write"
+
+# Pre-trust the workspace to skip the one-time "trust this folder" prompt (it can hang a
+# non-interactive run). This is about trust, not autonomy. The workdir is always /workspace.
+[projects."/workspace"]
+trust_level = "trusted"

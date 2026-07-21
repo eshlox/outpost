@@ -1,0 +1,50 @@
+# Starship prompt — minimal preset.
+# Starts with a sane default-ish layout; trims modules that add noise without
+# adding useful info for this workflow.
+
+# Two-line prompt (input on its own line) feels less cramped than one-line.
+add_newline = true
+
+# Leading newline above each prompt — extra breathing room between commands.
+format = """
+$directory\
+$git_branch\
+$git_status\
+$python\
+$nodejs\
+$rust\
+$cmd_duration\
+$line_break\
+$character"""
+
+# Cursor symbol — green ›  on success, red ›  on error. Minimal, no Powerline.
+[character]
+success_symbol = "[›](bold green)"
+error_symbol   = "[›](bold red)"
+
+[directory]
+truncation_length = 3                 # only show the last 3 path segments
+truncation_symbol = "…/"
+style             = "bold blue"
+
+[git_branch]
+symbol = " "                          # nerd-font branch glyph
+style  = "purple"
+
+[git_status]
+style = "yellow"
+
+# Show command duration only when something actually took a while.
+[cmd_duration]
+min_time = 2_000                      # ms — anything under 2s isn't worth showing
+style    = "italic dimmed"
+
+# Hide modules that aren't useful in this workflow.
+[package]
+disabled = true
+
+[hostname]
+disabled = true
+
+[username]
+disabled = true

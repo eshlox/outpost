@@ -1,0 +1,76 @@
+---
+title: outpost
+description: One hardened Docker container per project on a remote host, driven from your terminal.
+template: splash
+hero:
+  tagline: One container per project on a remote host — driven from your terminal.
+  actions:
+    - text: Quickstart
+      link: /quickstart/
+      icon: right-arrow
+      variant: primary
+    - text: Is this for you?
+      link: /is-this-for-you/
+      icon: open-book
+    - text: View on GitHub
+      link: https://github.com/eshlox/outpost
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+**outpost** is a sandbox for letting AI coding agents run **YOLO** — without a permission
+prompt on every step — because the **container is the security boundary, not the agent's
+approval dialog**. It runs one hardened Docker container per project on a remote Linux host,
+and you work *inside* it over SSH — Helix, lazygit, tmux, your agents. Your laptop only runs
+the SSH client. The whole tool is a single readable bash script: every step is a plain
+`docker` command you can read and run by hand. No VS Code, no devcontainer spec, no hidden
+lifecycle.
+
+```sh
+outpost projects new web -t node     # scaffold a project (Dockerfile + config)
+outpost setup web                    # build the image, start the container
+outpost sh web                       # drop into tmux inside; clone + run your code
+```
+
+<CardGrid stagger>
+  <Card title="A sandbox for YOLO agents" icon="approve-check">
+    Let agents run without approving every step: the **container** is the boundary, not a
+    permission prompt a compromised dep can talk a model into. `--cap-drop ALL`,
+    `no-new-privileges`, a per-project network, no host Docker socket, a fork-bomb guard —
+    the blast radius is one disposable project.
+  </Card>
+  <Card title="Disposable containers, durable state" icon="docker">
+    The container is throwaway; your workspace and home (dotfiles, agent auth + history,
+    node) live in named volumes. `outpost update` rebuilds on a fresh base and keeps them.
+  </Card>
+  <Card title="Your configs, your repo" icon="setting">
+    Projects live in your own directory and git repo, separate from the tool. Manage them
+    with `outpost projects new | edit | sync`. Update the tool with a clean `git pull`.
+  </Card>
+  <Card title="Git that never leaks your key" icon="github">
+    Commits sign and authenticate through your forwarded SSH agent (`ssh -A`); the private
+    key never enters the container. Per-use consent via Secretive (macOS), `ssh-add -c`, or
+    a FIDO2 tap.
+  </Card>
+  <Card title="Services + public tunnels" icon="random">
+    A project's Postgres/Redis/… run on the host engine, reachable by name. Expose dev
+    servers through per-project Cloudflare tunnels.
+  </Card>
+  <Card title="arm64 and amd64" icon="laptop">
+    Every baked-in tool ships for both architectures, so the base image builds and runs the
+    same on a cheap ARM VPS as on x86 — pick the host by price.
+  </Card>
+  <Card title="Readable, not magic" icon="open-book">
+    A single readable bash script you can read end to end — [`bin/outpost`](https://github.com/eshlox/outpost/blob/main/bin/outpost).
+    It builds an image and runs a container; that's it. The load-bearing *why* lives in the
+    [internals reference](/reference/internals/).
+  </Card>
+</CardGrid>
+
+## Where to next
+
+- [Is this for you?](/is-this-for-you/) — the opinionated stack this assumes.
+- [Installation](/installation/) and [Quickstart](/quickstart/) — be working in minutes.
+- [Architecture](/concepts/architecture/) — how the pieces fit.

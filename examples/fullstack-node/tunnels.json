@@ -1,0 +1,7 @@
+{
+  "routes": [
+    { "hostname": "web.example.dev",   "port": 4323 },
+    { "hostname": "admin.example.dev", "port": 4322 },
+    { "hostname": "api.example.dev",   "port": 3333 }
+  ]
+}

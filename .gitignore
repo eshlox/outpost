@@ -1,0 +1,8 @@
+# Node / Astro (docs site + tooling)
+node_modules/
+dist/
+.astro/
+
+# Local junk
+*.local
+.DS_Store

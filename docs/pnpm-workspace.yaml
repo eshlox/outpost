@@ -1,0 +1,6 @@
+# pnpm settings live here in pnpm 10+ (moved out of package.json's "pnpm" field).
+# Allow the native build scripts astro/vite/sharp legitimately need; pnpm blocks
+# every other dependency's install scripts by default.
+allowBuilds:
+  esbuild: true
+  sharp: true

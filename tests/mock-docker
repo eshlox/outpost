@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Stateful `docker` mock for outpost smoke tests. Tracks container existence via files
+# in $MOCK_STATE (keyed by container name), logs the main `run -d` to $RUNLOG, and
+# gives canned answers for inspects/port. Enough to exercise create, update
+# (rename/swap), running checks, ports, and destroy. Not a real engine.
+set -u
+S="${MOCK_STATE:?}"
+
+name_after_flag() {            # value following $1 in the remaining args
+  local want="$1"; shift; local prev=""
+  for a in "$@"; do [ "$prev" = "$want" ] && { printf '%s' "$a"; return; }; prev="$a"; done
+}
+last_arg() { printf '%s' "${@: -1}"; }
+
+case "${1:-} ${2:-}" in
+  "build "*) exit 0 ;;
+
+  "image inspect")
+    fmt=""
+    [ "${4:-}" = "--format" ] && fmt="${5:-}"
+    [ -z "$fmt" ] && exit 0
+    case "$fmt" in
+      *ExposedPorts*) echo "3000/tcp" ;;
+      *)              echo "" ;;
+    esac
+    ;;
+
+  "compose "*)                  # outpost up/down/ps/config (and compose version)
+    case " $* " in
+      *" config "*) f="$(name_after_flag -f "$@")"; [ -n "$f" ] && cat "$f" 2>/dev/null; exit 0 ;;  # render ~= the file
+      *)            printf '%s\n' "$*" >>"${RUNLOG:?}"; exit 0 ;;
+    esac ;;
+
+  "container inspect")          # ... [-f '{{.State.Running}}'] <name>  (name is last)
+    name="$(last_arg "$@")"
+    if [ -f "$S/$name" ]; then
+      case " $* " in *Running*) echo "true" ;; esac
+      exit 0
+    fi
+    exit 1 ;;
+
+  "network inspect")            exit 1 ;;
+  "volume create"|"network create") echo created ;;
+
+  "run -d")
+    shift; printf '%s\n' "$*" >>"${RUNLOG:?}"
+    n="$(name_after_flag --name "$@")"; [ -n "$n" ] && : >"$S/$n"
+    echo fake-id ;;
+  "run "*)                      exit 0 ;;          # e.g. fix_volume_ownership (--rm)
+
+  "start "*)                    : >"$S/$(last_arg "$@")"; echo started ;;
+  "stop "*)                     echo stopped ;;    # keep the state file (still "exists")
+  "rename "*)                   mv "$S/${2:-x}" "$S/${3:-y}" 2>/dev/null || true; echo renamed ;;
+
+  "exec "*)                     exit 0 ;;
+  "port "*)                     echo "3000/tcp -> 127.0.0.1:49153" ;;
+
+  "rm "*)
+    for a in "$@"; do case "$a" in rm|-f) ;; *) rm -f "$S/$a" ;; esac; done
+    echo ok ;;
+  "volume rm"*|"network rm"*|"logs "*|"ps "*) echo ok ;;
+
+  *)                            exit 0 ;;
+esac

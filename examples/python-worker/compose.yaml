@@ -1,0 +1,85 @@
+# Full backing stack for the python-worker example, run on the HOST engine by
+# `outpost up <name>`. Reached from the dev container by name (db:5432, redis:6379,
+# rabbit:5672, mongo:27017, search:9200, minio:9000). All creds are LOCAL DEV
+# defaults - not secrets.
+#
+# NOTE: services are NOT published to a host port. outpost reaches them by name on
+# the project network, and `outpost up`'s lint refuses published host ports (they
+# bypass UFW via Docker's own DNAT rules). Use `expose:` to document each service's
+# port. To open a web UI (RedisInsight, Rabbit mgmt, MinIO console) in your LAPTOP
+# browser, reach it from inside the box, or opt into publishing with
+# OUTPOST_ALLOW_UNSAFE_COMPOSE=1.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    expose: ["5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis/redis-stack
+    expose:
+      - "6379"
+      - "8001"                    # RedisInsight web UI
+    volumes: [redis-data:/data]
+
+  rabbit:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: app
+    expose:
+      - "5672"
+      - "15672"                   # Management UI
+
+  mongo:
+    image: mongo:7.0
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: example
+    volumes: [mongo-data:/data/db/]
+    expose: ["27017"]
+
+  search:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.28
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+    expose: ["9200"]
+    volumes: [es-data:/usr/share/elasticsearch/data]
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    expose:
+      - "9000"                    # S3 API
+      - "9001"                    # Console (web UI)
+    volumes: [minio-data:/data]
+
+volumes:
+  postgres-data:
+  redis-data:
+  mongo-data:
+  es-data:
+  minio-data:
+
+networks:
+  default:
+    # The per-project network outpost creates; `outpost up` ensures it exists and
+    # exports OUTPOST_PROJECT so this name resolves to outpost-<your-project>-net.
+    name: outpost-${OUTPOST_PROJECT}-net
+    external: true

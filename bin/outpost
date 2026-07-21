@@ -1,0 +1,1402 @@
+#!/usr/bin/env bash
+# outpost - one Docker container per project on a remote Linux host.
+#
+# One BASE image (shared/Dockerfile) bakes your tools + dotfiles; each project is a dir
+# under OUTPOST_PROJECTS_DIR with one Dockerfile (FROM outpost-base) and an optional
+# compose.yaml. outpost builds the image and runs ONE disposable container per project
+# with an EMPTY workspace - it clones/installs nothing, you do that inside; code and home
+# live in NAMED VOLUMES that survive rebuilds. Every action is a plain `docker` command
+# you can read and run by hand: no hidden lifecycle, no compose orchestration here.
+# Full mental model in docs/concepts/architecture + projects; services in docs/services.md.
+#
+# Run from an SSH session WITH agent forwarding for git:  ssh -A dev-box
+# (dev-box is just an example ~/.ssh/config host alias - name yours whatever.)
+set -euo pipefail
+
+OUTPOST_VERSION="0.1.0"
+
+# --- config file --------------------------------------------------------------
+# Optional per-user config sourced before anything else, so OUTPOST_* settings can
+# be set once instead of exported every session. Plain shell (KEY=value / export).
+OUTPOST_CONFIG="${OUTPOST_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/outpost/config}"
+# shellcheck source=/dev/null
+[ -f "$OUTPOST_CONFIG" ] && . "$OUTPOST_CONFIG"
+
+# --- paths / config -----------------------------------------------------------
+# OUTPOST_DIR is the TOOL repo root (readlink -f resolves the install symlink to the repo).
+OUTPOST_DIR="${OUTPOST_DIR:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+SHARED_DIR="$OUTPOST_DIR/shared"
+# Your PROJECTS live OUTSIDE the tool repo (their own dir/git repo), so updating the
+# tool (git pull) never touches them. Each project is a dir here with a Dockerfile.
+PROJECTS_DIR="${OUTPOST_PROJECTS_DIR:-$HOME/outpost-projects}"
+# Dotfiles baked into the base image. Defaults to the tool's shipped defaults; point
+# OUTPOST_DOTFILES_DIR at your own dotfiles dir to use them instead (see build_base).
+DOTFILES_DIR="${OUTPOST_DOTFILES_DIR:-$SHARED_DIR/home}"
+# Templates dir for `outpost projects new`.
+TEMPLATES_DIR="${OUTPOST_TEMPLATES_DIR:-$OUTPOST_DIR/templates}"
+ENGINE="${OUTPOST_ENGINE:-docker}"
+# The base + template Dockerfiles use BuildKit apt cache mounts (RUN --mount=type=cache) so
+# repeated `outpost base`/`update` don't re-download apt packages. Force BuildKit on for
+# docker (default since 23.0, available since 18.09); podman ignores this and supports the
+# cache mounts natively. Set DOCKER_BUILDKIT=0 to opt out - then remove the cache mounts too.
+export DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}"
+# The ~/.ssh/config host alias for this box, used only to print copy-pasteable `ssh -A`/
+# `ssh -L` hints (in `outpost ports` and the missing-agent error). Cosmetic; name yours
+# whatever and set OUTPOST_SSH_HOST to match. Default 'dev-box' is just an example alias.
+SSH_HOST="${OUTPOST_SSH_HOST:-dev-box}"
+# Editor for `outpost projects edit` (runs on the HOST, so a host editor).
+EDITOR_CMD="${VISUAL:-${EDITOR:-}}"
+# Auto-commit the projects repo on new/rm when set (otherwise commit only on sync).
+AUTO_COMMIT="${OUTPOST_AUTO_COMMIT:-}"
+# Hardcoded: project Dockerfiles say `FROM outpost-base:latest`, so this is not a
+# real override point. Change the name here AND in your Dockerfiles if ever needed.
+BASE_IMAGE="outpost-base:latest"
+# Short, per-UID state dir for the agent-bridge socket (kept short for the unix-socket path
+# limit, and off age-cleaned /tmp; override OUTPOST_STATE_DIR). Why: docs/reference/internals.
+STATE_DIR="${OUTPOST_STATE_DIR:-${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/outpost}}"
+STATE_DIR="${STATE_DIR:-/tmp/outpost-$(id -u)}"
+
+die()      { printf 'outpost: %s\n' "$*" >&2; exit 1; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing command: $1"; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  outpost base                  build / rebuild the shared base image (outpost-base)
+  outpost setup   <project>     first time: build images, start container, bootstrap
+  outpost setup   <project> --new [-t <tpl>]   one-shot: init projects dir (if needed) + scaffold + setup
+  outpost sh      <project>     attach into the container (tmux session per project)
+  outpost sh      <project> --no-agent   attach without the git agent bridge (observe-only; no ssh -A needed)
+  outpost exec    <project> <cmd>...    run a one-off command inside the container (scriptable; no tmux)
+  outpost dash    [project...]   one HOST tmux switching between projects (C-a = project, C-b = inside); --no-agent ok
+  outpost update  <project>     rebuild on the latest base, KEEP the volumes
+  outpost update  --all         update every project
+  outpost up      <project>     start the project's services (compose.yaml) on the host engine
+  outpost down    <project>     stop the project's services
+  outpost ps      <project>     show the project's services
+  outpost start   <project>     start a stopped container (re-adds it to a running dash)
+  outpost stop    <project>     stop the container (removes it from a running dash)
+  outpost restart <project>     stop then start (dash-aware; refreshes the git agent bridge)
+  outpost status  [project]     health at a glance: container/image/ports/bridge/services/volumes
+  outpost rm      <project>     remove the container (keeps volumes)
+  outpost destroy <project>     remove the container AND its volumes (drops project state)
+  outpost logs    <project> [-f]
+  outpost ls                    list outpost containers and their state
+  outpost cp      <project> <file>...   copy host file(s) into the project's /workspace (e.g. an image to reference by path)
+  outpost cp      <project> :/box/path... <dest>   pull file(s) OUT of the box to a host dest (reverse)
+  outpost ports   <project>     show the host ports the project's EXPOSE'd ports map to
+  outpost doctor                preflight the host (docker, socat, agent, uid, ...)
+
+Manage your project configs (in OUTPOST_PROJECTS_DIR, your own git repo):
+  outpost projects init [--remote <url>]   create the projects dir + git repo + a starter project
+  outpost projects new  <name> [-t <tpl>]  scaffold a new project from a template (default: minimal)
+  outpost projects edit <name> [file]      open the project's config in your editor (file: dockerfile|tunnels|compose|ports)
+  outpost projects ls                      list configured projects (and whether each has a container)
+  outpost projects rm   <name> [--destroy] remove the config dir (--destroy also drops the container + volumes)
+  outpost projects sync [-m "msg"]         git pull --rebase, commit (auto message), push
+  outpost projects templates               list available templates
+  outpost projects path                    print OUTPOST_PROJECTS_DIR
+
+  outpost upgrade               self-update the tool (git pull in OUTPOST_DIR)
+  outpost completion bash       print a bash completion script (source <(outpost completion bash))
+  outpost version               print the outpost version
+
+A project is a dir under your projects dir containing a single `Dockerfile` (FROM
+outpost-base) and, optionally, a `compose.yaml` for its own services (Postgres/Redis/
+...). You specify everything in the Dockerfile: extra packages, `EXPOSE <port>`
+(outpost publishes it to 127.0.0.1). outpost does NOT clone or install anything: it
+builds the image and starts an empty-workspace container. You `outpost sh`, then clone
+and run whatever you want inside. Services run on the HOST engine (`outpost up`) on the
+project network, reachable from the container by name - see docs/services.md.
+Git uses your forwarded SSH agent (ssh -A); see docs/git-and-ssh.md.
+
+Tip: alias it for daily use, e.g.  alias ot=outpost
+EOF
+}
+
+# --- project loading ----------------------------------------------------------
+# Strict, Docker-safe name: it becomes paths, container/volume/network names AND the
+# lowercase image tag. Why the exact regex: docs/reference/internals ("Project name validation").
+valid_name() { [[ "$1" =~ ^[a-z0-9]([a-z0-9_-]{0,61}[a-z0-9])?$ ]]; }
+
+list_projects() {
+  local d
+  [ -d "$PROJECTS_DIR" ] || return 0
+  for d in "$PROJECTS_DIR"/*/; do
+    [ -f "$d/Dockerfile" ] && printf '%s\n' "$(basename "$d")"
+  done
+}
+
+load_project() {
+  PROJECT="${1:?usage: outpost <cmd> <project>}"
+  valid_name "$PROJECT" || die "invalid project name '$PROJECT' (lowercase letters/digits/_/-, max 63; no uppercase, /, .., quotes or spaces)"
+  # Exported so a project's compose.yaml can interpolate it (e.g. the external network
+  # `outpost-${OUTPOST_PROJECT}-net`) and every `docker compose` call below can see it.
+  export OUTPOST_PROJECT="$PROJECT"
+  PDIR="$PROJECTS_DIR/$PROJECT"
+  [ -d "$PDIR" ]            || die "no project dir: $PDIR"
+  # A project is defined entirely by its Dockerfile (FROM outpost-base). No env file,
+  # no setup.sh, no clone: outpost only builds the image and runs the container.
+  [ -f "$PDIR/Dockerfile" ] || die "missing $PDIR/Dockerfile (a project is just a Dockerfile; see docs/concepts/projects)"
+
+  WORKDIR="/workspace"
+  CNAME="outpost-$PROJECT"
+  CODE_VOL="outpost-$PROJECT-code"
+  HOME_VOL="outpost-$PROJECT-home"
+  NETWORK="outpost-$PROJECT-net"
+  PROJ_IMAGE="outpost-$PROJECT:latest"
+
+  # Host-only state for the agent bridge. Only AGENT_DIR is mounted into the
+  # container (read-only); the pid file lives beside it, never in the container.
+  AGENT_ROOT="$STATE_DIR/agents/$PROJECT"
+  AGENT_DIR="$AGENT_ROOT/run"
+  AGENT_PID="$AGENT_ROOT/socat.pid"
+
+  # Create the state/agent dirs PRIVATELY and refuse a pre-existing dir owned by someone
+  # else (else a local user pre-creates it and reads your forwarded agent) - internals doc.
+  ( umask 077; mkdir -p "$AGENT_DIR" )
+  [ "$(stat -c %u "$STATE_DIR" 2>/dev/null)" = "$(id -u)" ] \
+    || die "refusing to use $STATE_DIR (exists but not owned by you)"
+  chmod 700 "$STATE_DIR" "$STATE_DIR/agents" "$AGENT_ROOT" "$AGENT_DIR" 2>/dev/null || true
+}
+
+container_exists() { "$ENGINE" container inspect "$CNAME" >/dev/null 2>&1; }
+container_running(){ [ "$("$ENGINE" container inspect -f '{{.State.Running}}' "$CNAME" 2>/dev/null)" = "true" ]; }
+
+# --- images -------------------------------------------------------------------
+# The base image bakes dotfiles: shipped defaults, or your OUTPOST_DOTFILES_DIR overlaid on
+# top (yours win, tool-integral bits survive). See docs/concepts/configuration.
+# Deterministic content hash of everything that goes INTO the base build (Dockerfile +
+# the two baked scripts + the effective dotfiles: shipped defaults then any overlay, in
+# build order + TZ). Stamped on the image as a label so `update` can skip an unchanged
+# rebuild. Stable across runs: sorted relative paths + contents, no mtimes.
+base_content_hash() {
+  {
+    printf 'tz=%s\n' "${OUTPOST_TZ:-}"
+    local f d rel
+    for f in "$SHARED_DIR/Dockerfile" "$SHARED_DIR/bootstrap-user.sh" "$SHARED_DIR/sshd.sh"; do
+      printf '== %s ==\n' "$(basename "$f")"; cat "$f" 2>/dev/null
+    done
+    for d in "$SHARED_DIR/home" "$DOTFILES_DIR"; do
+      [ -d "$d" ] || continue
+      while IFS= read -r rel; do printf '## %s ##\n' "$rel"; cat "$d/$rel" 2>/dev/null; done \
+        < <(cd "$d" && find . -type f | LC_ALL=C sort)
+    done
+  } | sha256sum | cut -d' ' -f1
+}
+
+# Rebuild the base only if its inputs changed since the last build (label comparison), so
+# `update` doesn't pay a base rebuild on every run. `outpost base` always rebuilds (explicit,
+# and the way to force an OS-package refresh).
+build_base_if_changed() {
+  local cur built
+  cur="$(base_content_hash)"
+  built="$("$ENGINE" image inspect -f '{{index .Config.Labels "outpost.base.hash"}}' "$BASE_IMAGE" 2>/dev/null || true)"
+  if [ -n "$built" ] && [ "$built" = "$cur" ]; then
+    echo "outpost: base image unchanged - skipping rebuild (run 'outpost base' to force)"
+    return 0
+  fi
+  build_base
+}
+
+build_base() {
+  need_cmd "$ENGINE"
+  [ -f "$SHARED_DIR/Dockerfile" ] || die "missing $SHARED_DIR/Dockerfile"
+  [ -d "$DOTFILES_DIR" ] || die "OUTPOST_DOTFILES_DIR not a directory: $DOTFILES_DIR"
+  echo "outpost: building $BASE_IMAGE"
+  # Stamp the content hash so build_base_if_changed can skip an unchanged rebuild next time.
+  local bargs=(--label "outpost.base.hash=$(base_content_hash)")
+  [ -n "${OUTPOST_TZ:-}" ] && bargs+=(--build-arg "TZ=$OUTPOST_TZ")
+  if [ "$DOTFILES_DIR" -ef "$SHARED_DIR/home" ]; then
+    "$ENGINE" build "${bargs[@]}" -t "$BASE_IMAGE" "$SHARED_DIR"
+  else
+    echo "outpost: overlaying dotfiles from $DOTFILES_DIR onto the shipped defaults"
+    local ctx; ctx="$(mktemp -d)"; trap 'rm -rf "$ctx"' RETURN
+    cp "$SHARED_DIR/Dockerfile" "$SHARED_DIR/bootstrap-user.sh" "$SHARED_DIR/sshd.sh" "$ctx/"
+    cp -a "$SHARED_DIR/home" "$ctx/home"     # shipped defaults (functional + neutral taste)
+    cp -a "$DOTFILES_DIR"/. "$ctx/home/"     # your dotfiles win on top
+    "$ENGINE" build "${bargs[@]}" -t "$BASE_IMAGE" "$ctx"
+  fi
+}
+
+ensure_base() {
+  "$ENGINE" image inspect "$BASE_IMAGE" >/dev/null 2>&1 || build_base
+}
+
+build_project_image() {
+  echo "outpost: building $PROJ_IMAGE from $PDIR/Dockerfile"
+  "$ENGINE" build -t "$PROJ_IMAGE" "$PDIR"
+}
+
+# Ports are read from the BUILT image, so you declare them in the Dockerfile
+# (EXPOSE <port>) - outpost never guesses them.
+image_ports() {  # -> one "port/proto" per line (e.g. 3000/tcp, 51820/udp)
+  "$ENGINE" image inspect "$PROJ_IMAGE" \
+    --format '{{range $p,$_ := .Config.ExposedPorts}}{{$p}}{{"\n"}}{{end}}' 2>/dev/null \
+    | grep -E '^[0-9]+/(tcp|udp)$' || true
+}
+
+# Optional per-project pin of a FIXED host port (in `ports.pin` beside the Dockerfile) so an
+# `ssh -L` survives restarts; unlisted ports keep the dynamic one. Format + trade-offs:
+# docs/reference/internals ("Port publishing and ports.pin").
+pinned_host_port() {  # $1 = container port -> echo the pinned host port, or nothing
+  local f="$PDIR/ports.pin" cport="$1" line c h
+  [ -f "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"; line="${line//[[:space:]]/}"   # strip comment + all whitespace
+    [ -n "$line" ] || continue
+    c="${line%%:*}"; h="${line##*:}"                    # "3333"->c=h ; "4322:14322"->c,h
+    [ "$c" = "$cport" ] && { printf '%s\n' "$h"; return 0; }
+  done < "$f"
+}
+
+# Best-effort check that a PINNED host port is free before `docker run`, so a clash surfaces
+# as a clear message instead of a cryptic "address already in use". Only pinned ports are
+# checked (dynamic ones can't clash); skipped entirely if ss/netstat are absent, so it never
+# blocks on a host without them. Why only pinned: docs/reference/internals ("ports.pin").
+pinned_port_free() {  # $1=host port  $2=proto(tcp|udp) -> 0 free/unknown, 1 taken
+  local port="$1" proto="${2:-tcp}"
+  if command -v ss >/dev/null 2>&1; then
+    case "$proto" in
+      tcp) ! ss -Hltn "sport = :$port" 2>/dev/null | grep -q . ;;
+      udp) ! ss -Hlun "sport = :$port" 2>/dev/null | grep -q . ;;
+    esac
+  elif command -v netstat >/dev/null 2>&1; then
+    ! netstat -ln 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"
+  else
+    return 0   # can't tell; let docker be the backstop
+  fi
+}
+
+# --- volumes + network --------------------------------------------------------
+ensure_volumes() {
+  "$ENGINE" volume create "$CODE_VOL" >/dev/null
+  "$ENGINE" volume create "$HOME_VOL" >/dev/null
+}
+
+# A per-project bridge (not the shared default bridge) so projects can't reach each other
+# by IP while keeping egress - backs the isolation claim in docs/concepts/security.
+ensure_network() {
+  "$ENGINE" network inspect "$NETWORK" >/dev/null 2>&1 \
+    || "$ENGINE" network create "$NETWORK" >/dev/null
+}
+
+# Guarantee /workspace and /home/ubuntu are owned by uid 1000 (ubuntu). Removes a
+# class of root-owned-volume failures on fresh or externally-created volumes.
+fix_volume_ownership() {
+  "$ENGINE" run --rm --user root \
+    -v "$CODE_VOL:/workspace" -v "$HOME_VOL:/home/ubuntu" \
+    "$BASE_IMAGE" sh -lc 'chown 1000:1000 /workspace /home/ubuntu' >/dev/null
+}
+
+# --- ssh agent bridge ---------------------------------------------------------
+# Re-point a STABLE per-project socket at THIS session's forwarded agent (socat). The
+# container bind-mounts the DIRECTORY, so restarts stay invisible. Why: docs/reference/internals.
+ensure_bridge() {
+  # OUTPOST_SKIP_BRIDGE (from `sh --no-agent` and the tests) means "no agent this session":
+  # tear down any existing bridge, don't just skip refreshing. Why: docs/reference/internals.
+  [ -n "${OUTPOST_SKIP_BRIDGE:-}" ] && { stop_bridge; return 0; }
+  command -v socat >/dev/null 2>&1 || die "socat not found on the host (the agent bridge needs it). Install: sudo apt install -y socat"
+  [ -n "${SSH_AUTH_SOCK:-}" ] || die "no SSH agent forwarded. Connect with: ssh -A $SSH_HOST"
+  [ -S "$SSH_AUTH_SOCK" ]     || die "SSH_AUTH_SOCK is not a socket: $SSH_AUTH_SOCK"
+  # The socket is mode 0600 owned by the host user; the container ubuntu user is
+  # uid 1000, so forwarding needs host uid == 1000 (see docs/git-and-ssh.md).
+  [ "$(id -u)" = 1000 ] || echo "outpost: warning: host uid $(id -u) != 1000; the container's ubuntu user may not be able to read the forwarded agent socket" >&2
+  local sock="$AGENT_DIR/agent.sock"
+  # Serialize the kill-old/spawn-new window against a concurrent sh/dash/update for the SAME
+  # project - two of them could otherwise kill each other's socat. flock on a
+  # per-project lock; released when this shell (or subshell, in dash/start) exits. Best-effort
+  # if flock is absent. Why a subshell is safe here: the pid is written to disk before release.
+  if command -v flock >/dev/null 2>&1; then exec 9>"$AGENT_ROOT/lock" && flock 9; fi
+  if [ -f "$AGENT_PID" ]; then
+    local oldpid; oldpid="$(cat "$AGENT_PID" 2>/dev/null || true)"
+    # Only kill if that PID is still OUR socat (the PID could have been reused).
+    [ -n "$oldpid" ] && grep -qa "$sock" "/proc/$oldpid/cmdline" 2>/dev/null \
+      && kill "$oldpid" 2>/dev/null || true
+    rm -f "$AGENT_PID"
+  fi
+  rm -f "$sock"
+  socat "UNIX-LISTEN:${sock},fork,mode=0600" "UNIX-CONNECT:${SSH_AUTH_SOCK}" >/dev/null 2>&1 &
+  echo "$!" >"$AGENT_PID"
+  local i; for i in $(seq 1 20); do [ -S "$sock" ] && break; sleep 0.1; done
+  [ -S "$sock" ] || die "agent bridge did not start: $sock"
+}
+
+# Kill this project's socat bridge (if it is still ours) and remove its state.
+# Called on rm/destroy so bridges do not pile up.
+stop_bridge() {
+  if [ -f "$AGENT_PID" ]; then
+    local pid; pid="$(cat "$AGENT_PID" 2>/dev/null || true)"
+    [ -n "$pid" ] && grep -qa "$AGENT_DIR/agent.sock" "/proc/$pid/cmdline" 2>/dev/null \
+      && kill "$pid" 2>/dev/null || true
+  fi
+  rm -rf "$AGENT_ROOT" 2>/dev/null || true
+}
+
+# --- container lifecycle ------------------------------------------------------
+start_project() {
+  ensure_volumes
+  ensure_network
+  ensure_bridge
+  if container_exists; then
+    container_running || "$ENGINE" start "$CNAME" >/dev/null
+    return
+  fi
+  # No image yet: fail with a hint instead of letting `docker run` try to PULL it from a
+  # registry (slow, confusing "pull access denied"). setup/update build the image first.
+  "$ENGINE" image inspect "$PROJ_IMAGE" >/dev/null 2>&1 \
+    || die "no image for $PROJECT yet (run: outpost setup $PROJECT)"
+  # Publish each EXPOSE'd port to a DYNAMIC 127.0.0.1 host port (collision-free across
+  # projects); ports.pin overrides with a fixed one. Why: docs/reference/internals.
+  local pubs=() pp proto cport hport
+  for pp in $(image_ports); do
+    proto="${pp#*/}"; cport="${pp%/*}"
+    hport="$(pinned_host_port "$cport")"
+    if [ -n "$hport" ]; then
+      pinned_port_free "$hport" "$proto" \
+        || die "pinned host port $hport ($PROJECT $cport/$proto) is already in use - free it or change $PDIR/ports.pin"
+      pubs+=(-p "127.0.0.1:$hport:$cport/$proto")   # pinned: stable host port
+    else
+      pubs+=(-p "127.0.0.1::$cport/$proto")          # default: dynamic, collision-free
+    fi
+  done
+  # Hardening: no caps, no privilege escalation (the workspace never drives Docker). Full
+  # threat model: docs/concepts/security.
+  local hardening=(--security-opt no-new-privileges:true --cap-drop ALL)
+  # Resource caps. --pids-limit is a generous fork-bomb guard (never bites a normal
+  # build); memory/cpus are OFF by default - opt in with OUTPOST_MEMORY / OUTPOST_CPUS.
+  local limits=(--pids-limit "${OUTPOST_PIDS_LIMIT:-4096}")
+  [ -n "${OUTPOST_MEMORY:-}" ]   && limits+=(--memory "$OUTPOST_MEMORY")
+  [ -n "${OUTPOST_CPUS:-}" ]     && limits+=(--cpus "$OUTPOST_CPUS")
+  # /dev/shm defaults to 64MB, which Chromium can exhaust (crashes under headless
+  # browser tests); OUTPOST_SHM_SIZE=1g raises it. Opt-in, like memory/cpus above.
+  [ -n "${OUTPOST_SHM_SIZE:-}" ] && limits+=(--shm-size "$OUTPOST_SHM_SIZE")
+  # Guarantee the agent-bridge dir exists and is OURS right before the bind mount. With
+  # `--no-agent` (or after an rm), ensure_bridge/stop_bridge removed $AGENT_ROOT; if we let
+  # `docker run -v "$AGENT_DIR:/run/agent"` create the missing host dir, Docker makes it
+  # ROOT-owned and the next real `sh` can't bind its socket there. Recreate it 0700/ours.
+  ( umask 077; mkdir -p "$AGENT_DIR" )
+  # Optional read-only rootfs (OUTPOST_READONLY=1): everything a compromised dep writes is
+  # non-persistent; the code/home VOLUMES stay writable, and tmpfs covers the paths tools
+  # need to write outside them. Opt-in, so nothing breaks by default. See concepts/security.
+  local rootfs=()
+  # /tmp gets exec (build tooling scratch-execs there); /run stays plain.
+  [ "${OUTPOST_READONLY:-}" = 1 ] && rootfs=(--read-only --tmpfs /tmp:exec --tmpfs /run)
+  # Bind the project's host config dir (Dockerfile/compose/tunnels.json) read-only at
+  # /run/outpost so the `just tunnel` recipes can read tunnels.json; a DIRECTORY bind so
+  # host edits reflect live. No restart policy. Why both: docs/reference/internals.
+  "$ENGINE" run -d \
+    --name "$CNAME" --hostname "$PROJECT" --user ubuntu --init \
+    --network "$NETWORK" \
+    "${hardening[@]}" "${limits[@]}" "${rootfs[@]}" \
+    -w "$WORKDIR" \
+    -e PROJECT="$PROJECT" \
+    -e SSH_AUTH_SOCK=/run/agent/agent.sock \
+    -v "$CODE_VOL:$WORKDIR" \
+    -v "$HOME_VOL:/home/ubuntu" \
+    -v "$AGENT_DIR:/run/agent:ro" \
+    -v "$PDIR:/run/outpost:ro" \
+    "${pubs[@]}" \
+    --entrypoint sleep "$PROJ_IMAGE" infinity >/dev/null
+}
+
+# Run a login bash command in the dev container. Extra args (before the script
+# runs) are docker-exec OPTIONS, e.g. -e KEY=VAL.
+exec_dev() {
+  local script="$1"; shift
+  "$ENGINE" exec "$@" "$CNAME" bash -lc "$script"
+}
+
+# The base image's own setup (vendored dotfiles + node + Claude/Codex/hunk), re-run per
+# container at setup/update; needs the forwarded agent for private dotfiles.
+bootstrap_user() { exec_dev 'outpost-bootstrap-user'; }
+
+# --- commands -----------------------------------------------------------------
+cmd_base() { build_base; }
+
+cmd_setup() {
+  # --new: one-shot onboarding so setup doesn't require four prior commands. Ensures the
+  # projects dir exists (init) and scaffolds the project from a template if it's missing,
+  # THEN sets it up. Without --new, setup behaves as before (the project must already exist).
+  local new='' name='' tpl=minimal
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --new)             new=1; shift ;;
+      -t|--template)     tpl="${2:?-t needs a template}"; shift 2 ;;
+      -t=*|--template=*) tpl="${1#*=}"; shift ;;
+      -*) die "setup: unknown flag '$1'" ;;
+      *)  name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: outpost setup <project> [--new [-t <template>]]"
+  if [ -n "$new" ]; then
+    [ -d "$PROJECTS_DIR" ] || cmd_projects_init
+    if [ ! -d "$PROJECTS_DIR/$name" ]; then
+      scaffold_project "$name" "$tpl"
+      echo "outpost: scaffolded '$name' from template '$tpl' at $PROJECTS_DIR/$name"
+      projects_autocommit "add $name"
+    fi
+  fi
+  load_project "$name"
+  # setup is first-run: start_project early-returns when the container already exists, so a
+  # re-run after an EXPOSE/packages/ports.pin edit rebuilds the IMAGE but keeps the OLD
+  # container - new ports never publish and nothing said so. Point the user at `update`.
+  local existed=; container_exists && existed=1
+  ensure_base
+  build_project_image
+  ensure_volumes
+  fix_volume_ownership
+  if [ -n "$existed" ]; then
+    echo "outpost: $PROJECT already has a container - rebuilt the image, but the RUNNING container is unchanged." >&2
+    echo "outpost: to apply Dockerfile changes (ports/packages), run: outpost update $PROJECT" >&2
+  fi
+  start_project
+  bootstrap_user
+  echo "outpost: $PROJECT ready. Enter it with: outpost sh $PROJECT (then clone + run inside)"
+}
+
+# Update one project (base image already (re)built by the caller). Swap-with-rollback:
+# the old container is only RENAMED + stopped until the new one is confirmed running, so
+# a bad image leaves you the previous working container. Returns non-zero on failure.
+_update_project() {
+  load_project "$1"
+  # Every pre-swap step is `|| return 1` on PURPOSE: the `--all` loop tests our status, which
+  # disables `set -e` here, so a failed build must not fall through and swap in a stale image.
+  # Do not remove them - docs/reference/internals ("update: swap-with-rollback").
+  build_project_image || return 1
+  ensure_volumes      || return 1
+  ensure_network      || return 1
+  ensure_bridge                  # dies on a missing agent/socat (a global precondition)
+  fix_volume_ownership || return 1
+
+  local had_old=0
+  if container_exists; then
+    had_old=1
+    "$ENGINE" stop "$CNAME" >/dev/null 2>&1 || true        # free the volumes (no concurrent writers)
+    "$ENGINE" rename "$CNAME" "${CNAME}.bak" >/dev/null 2>&1 || { echo "outpost: $PROJECT: could not rename old container" >&2; return 1; }
+  fi
+
+  # Keep the old container until the new one is fully up AND bootstrapped, so a
+  # bootstrap failure rolls back too (not just a failed start).
+  if start_project && container_running && bootstrap_user; then
+    [ "$had_old" = 1 ] && "$ENGINE" rm -f "${CNAME}.bak" >/dev/null 2>&1 || true
+    echo "outpost: $PROJECT updated (code + home volumes kept)"
+    return 0
+  fi
+
+  # New container failed to start or bootstrap: roll back to the previous one.
+  "$ENGINE" rm -f "$CNAME" >/dev/null 2>&1 || true
+  if [ "$had_old" = 1 ]; then
+    "$ENGINE" rename "${CNAME}.bak" "$CNAME" >/dev/null 2>&1 || true
+    "$ENGINE" start "$CNAME" >/dev/null 2>&1 || true
+  fi
+  echo "outpost: $PROJECT update FAILED - restored the previous container (volumes intact)" >&2
+  return 1
+}
+
+cmd_update() {
+  if [ "${1:-}" = "--all" ]; then
+    build_base_if_changed      # once; skips when the base inputs are unchanged
+    local p fail=0
+    for p in $(list_projects); do
+      echo "== updating $p =="
+      _update_project "$p" || { echo "outpost: WARNING: $p failed to update" >&2; fail=1; }
+    done
+    return "$fail"
+  fi
+  build_base_if_changed        # refresh base to pick up shared/Dockerfile edits (skips if unchanged)
+  _update_project "${1:?usage: outpost update <project>|--all}"
+}
+
+cmd_sh() {
+  # --no-agent: attach WITHOUT the git agent bridge (observe-only from a client with no
+  # agent to forward, e.g. Termius on iOS; git push/signing inside won't work).
+  local arg; local -a rest=()
+  for arg in "$@"; do
+    case "$arg" in
+      --no-agent) export OUTPOST_SKIP_BRIDGE=1 ;;
+      *)          rest+=("$arg") ;;
+    esac
+  done
+  set -- "${rest[@]}"
+  load_project "${1:-}"
+  start_project
+  # Attach or create a tmux session named after the project (-A), so agents/editors survive
+  # a dropped connection and a later `outpost sh` reattaches the same session.
+  "$ENGINE" exec -it "$CNAME" bash -lc 'exec tmux new-session -A -s "$(hostname)"'
+}
+
+# The command a dash window runs: a respawn loop around `outpost sh <project>` that re-reads
+# SSH_AUTH_SOCK each iteration (heals git after a reconnect). Why: docs/reference/internals.
+dash_window_cmd() {  # $1=self (outpost path)  $2=project  $3=sh flags
+  printf 'while :; do __s=$(tmux -L outpost-dash show-environment -g SSH_AUTH_SOCK 2>/dev/null | cut -d= -f2-); [ -n "$__s" ] && export SSH_AUTH_SOCK="$__s"; %s sh %s %s; sleep 0.3; done' \
+    "$(printf %q "$1")" "$(printf %q "$2")" "$3"
+}
+
+# Keep the dash switcher in sync with the containers: a named tmux SESSION on a dedicated
+# server, one WINDOW per project. stop drops a window, start adds one; both no-op with no dash.
+dash_session() { printf '%s' "${OUTPOST_DASH_SESSION:-boxes}"; }
+dash_tmux()    { tmux -L outpost-dash "$@"; }
+dash_up()      { command -v tmux >/dev/null 2>&1 && dash_tmux has-session -t "$(dash_session)" 2>/dev/null; }
+
+dash_drop_window() {  # $1=project  (no-op if no dash / no matching window)
+  dash_up || return 0
+  dash_tmux kill-window -t "$(dash_session):$1" 2>/dev/null || true
+}
+
+dash_add_window() {  # $1=project  (no-op if no dash; skips if already present)
+  dash_up || return 0
+  local s; s="$(dash_session)"
+  case " $(dash_tmux list-windows -t "$s" -F '#{window_name}' 2>/dev/null | tr '\n' ' ') " in
+    *" $1 "*) return 0 ;;
+  esac
+  local self; self="$(readlink -f "${BASH_SOURCE[0]}")"
+  dash_tmux new-window -d -t "$s" -n "$1" "$(dash_window_cmd "$self" "$1" "")"
+}
+
+# One HOST tmux (prefix C-a, status off) wrapping `outpost sh <project>` per window, so one
+# connection flips between projects. Design + tmux mechanics: docs/reference/internals ("The dash").
+#   outpost dash                 wrap every project that already has a container
+#   outpost dash a b c           wrap exactly these projects (creates them if needed)
+#   outpost dash --no-agent      forward --no-agent to every `outpost sh` (iOS/observe)
+cmd_dash() {
+  command -v tmux >/dev/null 2>&1 || die "tmux not found on the host. Install once: sudo apt install -y tmux"
+  local arg no_agent=; local -a names=() shargs=()
+  for arg in "$@"; do
+    case "$arg" in
+      --no-agent) shargs+=(--no-agent); no_agent=1 ;;
+      -*)         die "outpost dash: unknown flag '$arg'" ;;
+      *)          names+=("$arg") ;;
+    esac
+  done
+  # No names given: wrap every project that already has a container, so dash
+  # mirrors your live workspaces instead of spinning up every project dir.
+  if [ "${#names[@]}" -eq 0 ]; then
+    local p
+    while IFS= read -r p; do
+      "$ENGINE" container inspect "outpost-$p" >/dev/null 2>&1 && names+=("$p")
+    done < <(list_projects)
+    [ "${#names[@]}" -gt 0 ] || die "no running projects (run 'outpost setup <project>' first, or name projects: outpost dash <project>...)"
+  fi
+
+  local self; self="$(readlink -f "${BASH_SOURCE[0]}")"
+  local flags="${shargs[*]}"
+  local s="${OUTPOST_DASH_SESSION:-boxes}"
+  # Dedicated tmux SERVER (its own socket): the switcher's options (prefix,
+  # clipboard, ...) stay isolated and never leak into any other host tmux.
+  local -a tm=(tmux -L outpost-dash)
+  local fresh=
+  if ! "${tm[@]}" has-session -t "$s" 2>/dev/null; then
+    fresh=1
+    local i
+    for i in "${!names[@]}"; do
+      if [ "$i" -eq 0 ]; then
+        # new-session starts the server WITH a session: a bare `start-server`
+        # leaves an EMPTY server that exits again before the next command runs.
+        "${tm[@]}" new-session -d -s "$s" -n "${names[i]}" "$(dash_window_cmd "$self" "${names[i]}" "$flags")"
+        "${tm[@]}" set-option -g base-index 1
+        "${tm[@]}" set-option -g renumber-windows on
+      else
+        "${tm[@]}" new-window -t "$s" -n "${names[i]}" "$(dash_window_cmd "$self" "${names[i]}" "$flags")"
+      fi
+    done
+    "${tm[@]}" move-window -r -s "$s" -t "$s"   # renumber the windows to 1..N
+  else
+    # Dash still alive from a previous launch: reconcile by adding a window (in the
+    # BACKGROUND) for any requested project that lacks one. Why: docs/reference/internals.
+    local existing n
+    existing=" $("${tm[@]}" list-windows -t "$s" -F '#{window_name}' 2>/dev/null | tr '\n' ' ') "
+    for n in "${names[@]}"; do
+      case "$existing" in *" $n "*) continue ;; esac
+      "${tm[@]}" new-window -d -t "$s" -n "$n" "$(dash_window_cmd "$self" "$n" "$flags")"
+    done
+  fi
+  # (Re)apply the switcher options every attach (prefix/status/mouse/clipboard) so it stays a
+  # transparent layer and upgrades take effect. What each does: docs/reference/internals.
+  "${tm[@]}" set-option -t "$s" prefix C-a
+  "${tm[@]}" set-option -t "$s" status off
+  "${tm[@]}" set-option -t "$s" mouse on
+  "${tm[@]}" set-option -s set-clipboard on
+  "${tm[@]}" set-option -as terminal-features ",*:clipboard"
+
+  # Heal git auth across reconnects: republish this session's live SSH_AUTH_SOCK into the
+  # dash env and re-point each bridge (skipped for --no-agent). Why: docs/reference/internals.
+  if [ -z "$no_agent" ] && [ -n "${SSH_AUTH_SOCK:-}" ]; then
+    "${tm[@]}" set-environment -g SSH_AUTH_SOCK "$SSH_AUTH_SOCK"
+    local p
+    for p in "${names[@]}"; do ( load_project "$p"; ensure_bridge ) || true; done
+  fi
+
+  # Force window 1 only on first creation; on re-attach reopen on whatever project you last
+  # viewed (tmux remembers it across detach).
+  [ -n "$fresh" ] && "${tm[@]}" select-window -t "$s:1" 2>/dev/null || true
+  exec "${tm[@]}" attach -t "$s"
+}
+
+cmd_stop() {
+  load_project "${1:-}"
+  dash_drop_window "$PROJECT"   # kill the respawn loop first, so it can't restart the box below
+  container_exists && "$ENGINE" stop "$CNAME" >/dev/null || true
+}
+
+cmd_start() {
+  load_project "${1:-}"
+  container_exists || die "no container for $PROJECT (run: outpost setup $PROJECT)"
+  container_running || "$ENGINE" start "$CNAME" >/dev/null
+  # A host reboot wipes STATE_DIR (XDG_RUNTIME_DIR / /tmp), so the agent bridge is gone and
+  # git inside the box is dead until the next `sh`. Refresh it here when we actually have a
+  # forwarded agent; tolerate its absence so `start` still works from cron / a no-agent client
+  # (subshell so a die() inside can't kill us, matching cmd_dash). Why: docs/reference/internals.
+  if [ -z "${OUTPOST_SKIP_BRIDGE:-}" ] && [ -n "${SSH_AUTH_SOCK:-}" ]; then
+    ( ensure_bridge ) || echo "outpost: warning: could not refresh the git agent bridge; run 'outpost sh $PROJECT' once agent forwarding is available" >&2
+  fi
+  dash_add_window "$PROJECT"    # bring it back into a running dash (no-op if none)
+}
+
+# Stop then start (people reach for `restart`). Reuses cmd_stop/cmd_start so it stays
+# dash-aware (drops the window, then re-adds it) and refreshes the agent bridge on the way up.
+cmd_restart() {
+  load_project "${1:?usage: outpost restart <project>}"
+  cmd_stop "$PROJECT"
+  cmd_start "$PROJECT"
+}
+
+cmd_rm() {
+  load_project "${1:-}"
+  dash_drop_window "$PROJECT"   # kill the respawn loop first, else it recreates the box ~0.3s later
+  container_exists && "$ENGINE" rm -f "$CNAME" >/dev/null || true
+  stop_bridge
+  echo "outpost: removed container for $PROJECT (volumes kept; 'outpost destroy' drops them)"
+}
+
+cmd_destroy() {
+  load_project "${1:-}"
+  dash_drop_window "$PROJECT"   # kill the respawn loop first, else it recreates the box + fresh volumes
+  container_exists && "$ENGINE" rm -f "$CNAME" >/dev/null || true
+  stop_bridge
+  # Best-effort: also drop the host-engine services AND their data (--volumes, else Compose
+  # keeps Postgres/Redis volumes and `destroy` silently leaves service state behind).
+  local compose
+  if compose="$(project_compose 2>/dev/null)"; then
+    "$ENGINE" compose -p "outpost-$PROJECT" -f "$compose" down --volumes 2>/dev/null || true
+  fi
+  "$ENGINE" volume rm "$CODE_VOL" "$HOME_VOL" 2>/dev/null || true
+  "$ENGINE" network rm "$NETWORK" 2>/dev/null || true
+  echo "outpost: destroyed $PROJECT (container, volumes, network removed)"
+}
+
+cmd_logs() {
+  load_project "${1:?usage: outpost logs <project>}"; shift
+  "$ENGINE" logs "$@" "$CNAME"
+}
+
+# Run a one-off command inside the container (scriptable: exec/cron/CI, no tmux) through a
+# login shell that reproduces the interactive PATH + fnm. Why: docs/reference/internals.
+cmd_exec() {
+  load_project "${1:?usage: outpost exec <project> <cmd>...}"; shift
+  [ "$#" -ge 1 ] || die "usage: outpost exec <project> <cmd>..."
+  container_running || die "container for $PROJECT is not running (outpost sh $PROJECT / outpost start $PROJECT)"
+  local ttyflag=()
+  # Allocate a TTY only when we actually have one (interactive REPLs work), plain
+  # pipe otherwise so CI/cron output isn't mangled by pty processing.
+  if [ -t 0 ] && [ -t 1 ]; then ttyflag=(-it); fi
+  # The command's argv is passed positionally after `_` (which becomes $0), so args
+  # with spaces survive intact instead of being re-split by the shell.
+  "$ENGINE" exec "${ttyflag[@]}" "$CNAME" bash -lc '
+    export PATH="$HOME/.local/bin:$HOME/.local/share/fnm:$HOME/.npm-global/bin:$PATH"
+    command -v fnm >/dev/null 2>&1 && eval "$(fnm env --shell bash 2>/dev/null)" 2>/dev/null || true
+    exec "$@"' _ "$@"
+}
+
+cmd_ls() {
+  "$ENGINE" ps -a --filter "name=outpost-" \
+    --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+}
+
+# Copy files between the host and a project's container. Two directions:
+#   host -> box (default):  outpost cp <project> <hostfile>...        into /workspace
+#   box  -> host (reverse): outpost cp <project> :/box/path... <dest> pull a build artifact out
+# A source starting with ':' is a path INSIDE the box; then the LAST arg is the host dest.
+# Works on a stopped container; host->box files land uid 1000 (warns if your host uid
+# differs). Pasting over SSH hits the wrong clipboard, hence host->box. See docs/guides/daily.
+cmd_cp() {
+  load_project "${1:?usage: outpost cp <project> <file>... (or :/box/path... <dest> to pull out)}"; shift
+  [ "$#" -ge 1 ] || die "usage: outpost cp <project> <hostfile>...  |  outpost cp <project> :/box/path... <hostdest>"
+  container_exists || die "no container for $PROJECT (run: outpost setup $PROJECT)"
+
+  # Reverse if ANY source is a ':'-prefixed container path.
+  local a reverse=
+  for a in "$@"; do case "$a" in :?*) reverse=1; break ;; esac; done
+  if [ -n "$reverse" ]; then
+    [ "$#" -ge 2 ] || die "usage: outpost cp <project> :/box/path... <hostdest>"
+    local dest="${*: -1}" srcs=("${@:1:$(($# - 1))}") s cpath
+    for s in "${srcs[@]}"; do
+      case "$s" in :?*) cpath="${s#:}" ;;
+        *) die "reverse copy: every source must be a container path starting with ':' (got '$s')" ;;
+      esac
+      "$ENGINE" cp "$CNAME:$cpath" "$dest" || die "failed to copy $PROJECT:$cpath -> $dest"
+      printf '  %s:%s -> %s\n' "$PROJECT" "$cpath" "$dest"
+    done
+    return
+  fi
+
+  [ "$(id -u)" = 1000 ] || echo "outpost: warning: host uid $(id -u) != 1000; copied files may not be owned by the container's ubuntu user" >&2
+  local f
+  for f in "$@"; do
+    [ -e "$f" ] || die "no such file: $f"
+    # Trailing slash on the dest: copy INTO /workspace (as /workspace/<basename>),
+    # never overwriting the directory itself.
+    "$ENGINE" cp "$f" "$CNAME:$WORKDIR/" \
+      || die "failed to copy $f into $PROJECT:$WORKDIR"
+    printf '  %s -> %s/%s\n' "$f" "$WORKDIR" "$(basename "$f")"
+  done
+  echo "outpost: reference these by path inside $PROJECT, e.g. in Claude Code: $WORKDIR/$(basename "$1")"
+}
+
+# Show the dynamic host port(s) the project's EXPOSE'd ports are published to,
+# with a copy-pasteable ssh -L to reach each from your laptop.
+cmd_ports() {
+  load_project "${1:?usage: outpost ports <project>}"
+  container_exists || die "no container for $PROJECT (run: outpost setup $PROJECT)"
+  local map; map="$("$ENGINE" port "$CNAME" 2>/dev/null)"
+  [ -n "$map" ] || { echo "outpost: $PROJECT publishes no ports (add EXPOSE to its Dockerfile)"; return 0; }
+  echo "outpost: $PROJECT ports (container -> host 127.0.0.1):"
+  # each line: "3000/tcp -> 127.0.0.1:49153"
+  echo "$map" | while read -r line; do
+    [ -n "$line" ] || continue
+    cport="${line%%/*}"; hport="${line##*:}"
+    printf '  %s -> %s   reach from your laptop: ssh -A -L %s:localhost:%s %s\n' "$cport" "$hport" "$cport" "$hport" "$SSH_HOST"
+  done
+}
+
+# --- status helpers -----------------------------------------------------------
+# Is this session's agent bridge live for the loaded project? (socat running + socket present)
+bridge_alive() {
+  local pid
+  [ -S "$AGENT_DIR/agent.sock" ] || return 1
+  [ -f "$AGENT_PID" ] || return 1
+  pid="$(cat "$AGENT_PID" 2>/dev/null)" || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# Is the project image OLDER than the base it should be built on? (base rebuilt since -> stale)
+# String compare of the RFC3339 Created timestamps; best-effort (returns "fresh" if unknown).
+image_is_stale() {
+  local pc bc
+  pc="$("$ENGINE" image inspect -f '{{.Created}}' "$PROJ_IMAGE" 2>/dev/null)" || return 1
+  bc="$("$ENGINE" image inspect -f '{{.Created}}' "$BASE_IMAGE" 2>/dev/null)" || return 1
+  [ -n "$pc" ] && [ -n "$bc" ] && [[ "$bc" > "$pc" ]]
+}
+
+# Human size of a named volume, via a throwaway container (du). "?" if it can't be measured.
+volume_size() {  # $1 = volume name
+  local s
+  s="$("$ENGINE" run --rm -v "$1:/v:ro" "$BASE_IMAGE" sh -c 'du -sh /v 2>/dev/null | cut -f1' 2>/dev/null)"
+  [ -n "$s" ] && printf '%s' "$s" || printf '?'
+}
+
+# One summary line per project (no volume du - too slow across every project).
+status_summary() {  # $1 = project
+  local cn="outpost-$1" state ports
+  if [ "$("$ENGINE" container inspect -f '{{.State.Running}}' "$cn" 2>/dev/null)" = true ]; then state=running
+  elif "$ENGINE" container inspect "$cn" >/dev/null 2>&1; then state=stopped
+  else state=absent; fi
+  ports="$("$ENGINE" port "$cn" 2>/dev/null | paste -sd', ' - 2>/dev/null)"
+  printf '  %-22s %-8s %s\n' "$1" "$state" "$ports"
+}
+
+# outpost status [project]: the daily-driver "what's the state of everything" command.
+# No project -> a summary row per project. One project -> container state, image-vs-base
+# freshness, published ports, agent bridge, compose services, and volume disk usage.
+cmd_status() {
+  if [ -z "${1:-}" ]; then
+    local p any=
+    for p in $(list_projects); do status_summary "$p"; any=1; done
+    [ -n "$any" ] || echo "outpost: no projects yet (outpost projects new <name>)"
+    return
+  fi
+  load_project "$1"
+  local state
+  if container_running; then state="running"
+  elif container_exists; then state="stopped"
+  else state="absent (outpost setup $PROJECT)"; fi
+  echo "outpost: $PROJECT"
+  printf '  container:  %s\n' "$state"
+
+  if ! "$ENGINE" image inspect "$PROJ_IMAGE" >/dev/null 2>&1; then
+    printf '  image:      not built (outpost setup %s)\n' "$PROJECT"
+  elif image_is_stale; then
+    printf '  image:      STALE - base is newer (outpost update %s)\n' "$PROJECT"
+  else
+    printf '  image:      current with base\n'
+  fi
+
+  if container_exists; then
+    local ports; ports="$("$ENGINE" port "$CNAME" 2>/dev/null | paste -sd', ' - 2>/dev/null)"
+    printf '  ports:      %s\n' "${ports:-none published (add EXPOSE to the Dockerfile)}"
+  fi
+
+  if bridge_alive; then printf '  agent:      bridge up (socat %s)\n' "$(cat "$AGENT_PID" 2>/dev/null)"
+  else printf '  agent:      no bridge (git needs ssh -A + outpost sh/start %s)\n' "$PROJECT"; fi
+
+  local compose
+  if compose="$(project_compose 2>/dev/null)"; then
+    local svc; svc="$("$ENGINE" compose -p "outpost-$PROJECT" -f "$compose" ps --format '{{.Name}} {{.State}}' 2>/dev/null | paste -sd'; ' - 2>/dev/null)"
+    printf '  services:   %s (%s)\n' "${svc:-none up}" "$(basename "$compose")"
+  fi
+
+  if container_exists || "$ENGINE" volume inspect "$CODE_VOL" >/dev/null 2>&1; then
+    printf '  volumes:    code=%s  home=%s\n' "$(volume_size "$CODE_VOL")" "$(volume_size "$HOME_VOL")"
+  fi
+}
+
+# A project's optional services compose, beside the Dockerfile on the HOST (not in the repo
+# volume) so outpost runs it on the host engine. Echoes the path, or returns 1 if none.
+project_compose() {
+  local f
+  for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+    [ -f "$PDIR/$f" ] && { printf '%s\n' "$PDIR/$f"; return 0; }
+  done
+  return 1
+}
+
+# Refuse a compose that asks for host-escalating settings (these run on the HOST root daemon
+# and would breach the workspace isolation). Lints the RESOLVED `docker compose config`;
+# fail-closed, override OUTPOST_ALLOW_UNSAFE_COMPOSE=1. Each check: docs/reference/internals.
+lint_compose() {  # $1 = compose file
+  [ "${OUTPOST_ALLOW_UNSAFE_COMPOSE:-}" = 1 ] && return 0
+  local cfg bad=()
+  cfg="$("$ENGINE" compose -p "outpost-$PROJECT" -f "$1" config 2>&1)" \
+    || die "invalid compose for $PROJECT: $cfg"
+  grep -qE '^[[:space:]]*privileged:[[:space:]]*true' <<<"$cfg" && bad+=("privileged: true")
+  # Namespace joins (the host's or another container's/service's) - hand a service a
+  # namespace outside its own sandbox.
+  grep -qE '^[[:space:]]*(network_mode|pid|ipc|userns_mode|cgroup_parent):[[:space:]]*"?(host|container:|service:)' <<<"$cfg" \
+    && bad+=("namespace join (network/pid/ipc/userns/cgroup: host|container:|service:)")
+  # volumes_from mounts another container's volumes (its data and any binds it carries).
+  grep -qE '^[[:space:]]*volumes_from:' <<<"$cfg" && bad+=("volumes_from (mounts another container's volumes)")
+  # Published host ports bypass UFW and aren't needed here (reach services by name on the
+  # project network). `config` renders them with `published:`; container-only `expose:` has none.
+  grep -qE '^[[:space:]]*published:[[:space:]]*"?[0-9]' <<<"$cfg" \
+    && bad+=("published host port (reach services by name on the project network instead; publishing bypasses UFW)")
+  # cap_add: flag ALL + specific dangerous caps, but ONLY under cap_add (never the good
+  # `cap_drop: ALL`), so we track which block each list item belongs to. Why: internals doc.
+  awk '
+    /^[[:space:]]*cap_add:[[:space:]]*$/  { blk="add";  next }
+    /^[[:space:]]*cap_drop:[[:space:]]*$/ { blk="drop"; next }
+    /^[[:space:]]*[A-Za-z_]+:/            { blk="" }        # any other key ends the list block
+    blk=="add" && $0 ~ /^[[:space:]]*-[[:space:]]*"?(ALL|SYS_ADMIN|SYS_MODULE|SYS_PTRACE|SYS_RAWIO|DAC_READ_SEARCH|BPF|MKNOD)"?[[:space:]]*$/ { found=1 }
+    END { exit found?0:1 }
+  ' <<<"$cfg" && bad+=("dangerous cap_add (ALL / SYS_ADMIN / SYS_PTRACE / ...)")
+  grep -qiE '(apparmor[:=]unconfined|seccomp[:=]unconfined|no-new-privileges[:=][[:space:]]*"?false)' <<<"$cfg" \
+    && bad+=("security_opt relaxation (unconfined / no-new-privileges:false)")
+  # Raw host DEVICES. A services compose (Postgres/Redis/...) never needs to be handed a
+  # host device or a device cgroup rule; flag the key wholesale (both survive `config`).
+  grep -qE '^[[:space:]]*devices:[[:space:]]*(\[|$)' <<<"$cfg" \
+    && bad+=("devices: (raw host device access)")
+  grep -qE '^[[:space:]]*device_cgroup_rules:' <<<"$cfg" \
+    && bad+=("device_cgroup_rules: (host device cgroup access)")
+  # Host PATHS that escape the project dir (a bind `source`/secret `file`/`device`/build
+  # `context`/`additional_contexts`) read host state past the isolation. We ALLOWLIST only
+  # paths resolving inside $PDIR, canonicalizing with realpath first so a symlink or `../`
+  # can't smuggle one past. Full approach + edge cases: docs/reference/internals ("Compose lint").
+  local src real pdir_real
+  pdir_real="$(realpath -m "$PDIR" 2>/dev/null || printf '%s' "$PDIR")"
+  while IFS= read -r src; do
+    case "$src" in /*) ;; *) continue ;; esac             # only absolute host paths matter
+    real="$(realpath -m "$src" 2>/dev/null || printf '%s' "$src")"
+    case "$real" in
+      "$pdir_real"|"$pdir_real"/*) : ;;                    # truly inside the project dir - safe
+      *) bad+=("host path mount/secret/context: $src") ;;  # escapes the project dir
+    esac
+  done < <(awk '
+    match($0, /^[[:space:]]*(source|file|device|context):[[:space:]]*/) {
+      v=substr($0, RLENGTH+1); gsub(/^"|"$/,"",v); if (v!="") print v; next
+    }
+    /^[[:space:]]*additional_contexts:[[:space:]]*$/ { inac=1; ind=match($0,/[^ ]/); next }
+    inac {
+      cur=match($0,/[^ ]/)
+      if (cur>0 && cur<=ind) { inac=0 }
+      else if (match($0,/:[[:space:]]*/)) { v=substr($0,RSTART+RLENGTH); gsub(/^"|"$/,"",v); if (v!="") print v }
+    }
+  ' <<<"$cfg")
+
+  # env_file: reads a host file's CONTENTS into a service's environment - same class as a
+  # host bind. But `docker compose config` MERGES env_file into `environment:` and DROPS the
+  # key, so it never appears in the resolved $cfg we scanned above; scan the RAW file ($1)
+  # for it, resolve relative paths against $PDIR, and allowlist only paths inside the project
+  # dir. Over-printing non-path tokens (e.g. a long-form `required: false`) is harmless: they
+  # resolve INSIDE $PDIR and pass. Scalar, block-list, and flow-list forms all handled.
+  local ef
+  while IFS= read -r ef; do
+    case "$ef" in /*) : ;; *) ef="$PDIR/$ef" ;; esac
+    real="$(realpath -m "$ef" 2>/dev/null || printf '%s' "$ef")"
+    case "$real" in
+      "$pdir_real"|"$pdir_real"/*) : ;;
+      *) bad+=("env_file host path: $ef") ;;
+    esac
+  done < <(awk '
+    match($0, /^[[:space:]]*env_file:[[:space:]]*/) {
+      v=substr($0, RLENGTH+1); gsub(/^"|"$/,"",v)
+      if (v ~ /^\[/) { gsub(/[]["]/,"",v); n=split(v,a,","); for(i=1;i<=n;i++){gsub(/^[ ]+|[ ]+$/,"",a[i]); if(a[i]!="")print a[i]}; next }
+      if (v!="") { print v; next }
+      infl=1; ind=match($0,/[^ ]/); next
+    }
+    infl {
+      cur=match($0,/[^ ]/)
+      if (cur>0 && cur<=ind) { infl=0; next }
+      line=$0
+      sub(/^[[:space:]]*-[[:space:]]*/,"",line)   # block-list dash
+      sub(/^path:[[:space:]]*/,"",line)           # long-form { path: X, required: Y }
+      sub(/#.*$/,"",line); gsub(/^"|"$/,"",line); gsub(/[[:space:]]+$/,"",line)
+      if (line!="") print line
+    }
+  ' "$1")
+
+  [ "${#bad[@]}" -eq 0 ] && return 0
+  echo "outpost: refusing to start $PROJECT services - its compose requests host-escalating settings:" >&2
+  printf '  - %s\n' "${bad[@]}" >&2
+  echo "These run on the HOST root daemon and would breach the workspace isolation." >&2
+  echo "Remove them, or re-run with OUTPOST_ALLOW_UNSAFE_COMPOSE=1 to override (you accept the risk)." >&2
+  return 1
+}
+
+# Bring a project's services UP on the host engine, on outpost-<project>-net (external in the
+# compose). The container is on that network, so it reaches them by name - see docs/services.md.
+cmd_up() {
+  load_project "${1:?usage: outpost up <project>}"
+  local compose; compose="$(project_compose)" \
+    || die "no services compose for $PROJECT (add $PDIR/compose.yaml; see docs/services.md)"
+  "$ENGINE" network inspect "$NETWORK" >/dev/null 2>&1 || "$ENGINE" network create "$NETWORK" >/dev/null
+  lint_compose "$compose" || return 1
+  # Make the trust boundary visible: unlike the workspace container (cap-drop ALL, no
+  # privilege escalation, no host socket), services run on the HOST engine as root. The lint
+  # above blocks the host-escalating knobs, but the images themselves are yours to vet.
+  echo "outpost: $PROJECT services run on the HOST engine as root - compose is linted, but review the images you run." >&2
+  "$ENGINE" compose -p "outpost-$PROJECT" -f "$compose" up -d
+  echo "outpost: $PROJECT services up on $NETWORK (see 'outpost ps $PROJECT'); reach them from the container by service name, e.g. db:5432"
+}
+
+# Stop a project's services (keeps their volumes; `outpost destroy` drops everything).
+cmd_down() {
+  load_project "${1:?usage: outpost down <project>}"
+  local compose; compose="$(project_compose)" || die "no services compose for $PROJECT"
+  "$ENGINE" compose -p "outpost-$PROJECT" -f "$compose" down
+}
+
+# Show a project's host-engine services, scoped by com.docker.compose.project=outpost-<p>.
+cmd_ps() {
+  load_project "${1:?usage: outpost ps <project>}"
+  local compose; compose="$(project_compose)" || die "no services compose for $PROJECT"
+  "$ENGINE" compose -p "outpost-$PROJECT" -f "$compose" ps
+}
+
+# Preflight the host before first use. Exits non-zero if any hard check fails.
+cmd_doctor() {
+  local fails=0
+  _ok()   { printf '  ok    %s\n' "$1"; }
+  _warn() { printf '  warn  %s\n' "$1"; }
+  _fail() { printf '  FAIL  %s\n' "$1"; fails=$((fails + 1)); }
+  echo "outpost doctor:"
+
+  command -v "$ENGINE" >/dev/null 2>&1 && _ok "$ENGINE present" || _fail "$ENGINE not found"
+  "$ENGINE" info >/dev/null 2>&1       && _ok "$ENGINE daemon reachable" || _fail "$ENGINE daemon not reachable (in the docker group? daemon up?)"
+  command -v git   >/dev/null 2>&1 && _ok "git present"   || _fail "git missing"
+  command -v socat >/dev/null 2>&1 && _ok "socat present (agent bridge)" || _fail "socat missing (the git agent bridge needs it)"
+  # Host tmux is needed only for `outpost dash` (the per-container tmux lives in the
+  # image); a warn, not a hard fail, so a dash-less workflow still passes doctor.
+  command -v tmux  >/dev/null 2>&1 && _ok "tmux present (host; for 'outpost dash')" || _warn "tmux missing on host ('outpost dash' needs it; 'outpost sh' does not)"
+
+  [ "$(id -u)" = 1000 ] && _ok "host uid is 1000 (forwarded agent readable in container)" \
+    || _warn "host uid $(id -u) != 1000 (forwarded agent may be unreadable; see docs/git-and-ssh.md)"
+
+  if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "${SSH_AUTH_SOCK}" ]; then
+    ssh-add -l >/dev/null 2>&1 && _ok "SSH agent forwarded, keys present" \
+      || _warn "SSH agent socket present but lists no keys (use ssh -A)"
+  else
+    _warn "no SSH agent forwarded (use ssh -A)"
+  fi
+
+  for f in "$OUTPOST_DIR/bin/outpost" "$OUTPOST_DIR/install.sh"; do
+    [ -x "$f" ] && _ok "executable: ${f#"$OUTPOST_DIR"/}" || _fail "not executable: ${f#"$OUTPOST_DIR"/} (chmod +x it)"
+  done
+
+  "$ENGINE" image inspect "$BASE_IMAGE" >/dev/null 2>&1 && _ok "base image $BASE_IMAGE built" \
+    || _warn "base image not built yet (run: outpost base)"
+
+  # Docker Compose plugin: outpost up/down runs the project's services on the host engine.
+  "$ENGINE" compose version >/dev/null 2>&1 && _ok "docker compose plugin present (outpost up/down)" \
+    || _warn "docker compose plugin missing (outpost up/down needs it; see docs/host-provisioning.md)"
+
+  # Docker backing store on a nosuid mount silently drops setuid/file-caps at exec INSIDE
+  # containers (sudo/ping break) - a cheap gotcha to surface. Why: docs/reference/internals.
+  if command -v findmnt >/dev/null 2>&1; then
+    local droot seen=" " p
+    droot="$("$ENGINE" info -f '{{.DockerRootDir}}' 2>/dev/null || true)"
+    for p in "$droot" /var/lib/docker /var/lib/containerd; do
+      [ -n "$p" ] && [ -e "$p" ] || continue
+      case "$seen" in *" $p "*) continue ;; esac
+      seen="$seen$p "
+      if findmnt -no OPTIONS -T "$p" 2>/dev/null | grep -qw nosuid; then
+        _warn "$p is on a nosuid mount (setuid/file-caps break inside containers)"
+      else
+        _ok "$p backing store allows suid"
+      fi
+    done
+  else
+    _warn "findmnt unavailable; cannot check Docker backing store for nosuid"
+  fi
+
+  echo
+  [ "$fails" -eq 0 ] && { echo "outpost doctor: ready."; return 0; }
+  echo "outpost doctor: $fails hard check(s) failed - fix the FAIL lines above." >&2
+  return 1
+}
+
+# --- project config management (outpost projects ...) -------------------------
+# Manage the CONFIG FILES under OUTPOST_PROJECTS_DIR (your own git repo), separate from the
+# container-lifecycle commands above: scaffold files, edit them as plain files, git via `sync`.
+projects_usage() {
+  cat <<'EOF'
+Usage: outpost projects <command>
+  init [--remote <url>]    create OUTPOST_PROJECTS_DIR, git init, optional remote, a starter project
+  new  <name> [-t <tpl>]   scaffold a new project from templates/<tpl> (default: minimal)
+  edit <name> [file]       open the project dir (or one file: dockerfile|tunnels|compose|ports) in your editor
+  ls                       list configured projects (and whether each has a container)
+  rm   <name> [--destroy]  remove the config dir; --destroy also drops the container + volumes
+  sync [-m "msg"]          git pull --rebase --autostash, commit (auto message), push
+  templates                list available templates
+  path                     print OUTPOST_PROJECTS_DIR
+EOF
+}
+
+# Prefer $VISUAL/$EDITOR, then a common host TUI editor. Runs on the HOST.
+pick_editor() {
+  [ -n "$EDITOR_CMD" ] && { printf '%s\n' "$EDITOR_CMD"; return 0; }
+  local e; for e in hx nvim vim vi nano; do
+    command -v "$e" >/dev/null 2>&1 && { printf '%s\n' "$e"; return 0; }
+  done
+  return 1
+}
+
+# True ONLY when PROJECTS_DIR is the git repo's TOP LEVEL (not nested in a parent repo):
+# `git add -A` would otherwise stage the parent's files. Why: docs/reference/internals.
+projects_is_git() {
+  local top
+  top="$(git -C "$PROJECTS_DIR" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [ "$(realpath -m "$top" 2>/dev/null || printf '%s' "$top")" \
+    = "$(realpath -m "$PROJECTS_DIR" 2>/dev/null || printf '%s' "$PROJECTS_DIR")" ]
+}
+projects_has_origin() { git -C "$PROJECTS_DIR" remote get-url origin >/dev/null 2>&1; }
+
+# Commit staged changes with an auto message when OUTPOST_AUTO_COMMIT is set.
+projects_autocommit() {  # $1 = message
+  [ -n "$AUTO_COMMIT" ] && projects_is_git || return 0
+  git -C "$PROJECTS_DIR" add -A
+  git -C "$PROJECTS_DIR" diff --cached --quiet || git -C "$PROJECTS_DIR" commit -q -m "$1"
+}
+
+# Summarize staged changes by top-level project dir: "add api; update web; remove old".
+projects_auto_message() {
+  local f a m d parts=() msg
+  f='^(README\.md|\.gitignore)$'
+  a="$(git -C "$PROJECTS_DIR" diff --cached --name-only --diff-filter=A | cut -d/ -f1 | grep -vE "$f" | sort -u | paste -sd, -)"
+  m="$(git -C "$PROJECTS_DIR" diff --cached --name-only --diff-filter=M | cut -d/ -f1 | grep -vE "$f" | sort -u | paste -sd, -)"
+  d="$(git -C "$PROJECTS_DIR" diff --cached --name-only --diff-filter=D | cut -d/ -f1 | grep -vE "$f" | sort -u | paste -sd, -)"
+  [ -n "$a" ] && parts+=("add $a")
+  [ -n "$m" ] && parts+=("update $m")
+  [ -n "$d" ] && parts+=("remove $d")
+  [ "${#parts[@]}" -gt 0 ] || { echo "sync projects"; return; }
+  printf -v msg '%s; ' "${parts[@]}"; echo "${msg%; }"
+}
+
+# Copy templates/<tpl> -> PROJECTS_DIR/<name>. Shared by `new` and `init`.
+scaffold_project() {  # $1=name $2=template
+  local name="$1" tpl="${2:-minimal}"
+  local src="$TEMPLATES_DIR/$tpl" dst="$PROJECTS_DIR/$name"
+  valid_name "$name" || die "invalid project name '$name' (lowercase letters/digits/_/-, max 63)"
+  [ -d "$src" ] || die "no such template '$tpl' (see: outpost projects templates)"
+  [ -e "$dst" ] && die "project '$name' already exists at $dst"
+  mkdir -p "$PROJECTS_DIR"; cp -r "$src" "$dst"
+}
+
+cmd_projects_init() {
+  local remote=
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --remote)   remote="${2:?--remote needs a URL}"; shift 2 ;;
+      --remote=*) remote="${1#--remote=}"; shift ;;
+      *) die "projects init: unknown arg '$1'" ;;
+    esac
+  done
+  need_cmd git
+  mkdir -p "$PROJECTS_DIR"
+  projects_is_git || { git -C "$PROJECTS_DIR" init -q; echo "outpost: initialized git repo in $PROJECTS_DIR"; }
+  if [ -n "$remote" ]; then
+    git -C "$PROJECTS_DIR" remote remove origin 2>/dev/null || true
+    git -C "$PROJECTS_DIR" remote add origin "$remote"
+    echo "outpost: set origin -> $remote"
+  fi
+  [ -f "$PROJECTS_DIR/.gitignore" ] || printf '%s\n' '.DS_Store' '*.local' > "$PROJECTS_DIR/.gitignore"
+  [ -f "$PROJECTS_DIR/README.md" ] || cat > "$PROJECTS_DIR/README.md" <<'RM'
+# outpost projects
+
+My private outpost project configs. Each subdirectory is one project: a `Dockerfile`
+(`FROM outpost-base:latest`) plus optional `tunnels.json`, `compose.yaml`, `ports.pin`.
+Manage with `outpost projects ...`; build/run with `outpost setup|sh|up`.
+RM
+  [ -d "$PROJECTS_DIR/example" ] || { scaffold_project example minimal && echo "outpost: created starter project 'example'"; }
+  echo "outpost: projects dir ready at $PROJECTS_DIR"
+  echo "  next: outpost projects new <name>  ->  outpost setup <name>  ->  outpost sh <name>"
+}
+
+cmd_projects_new() {
+  local tpl=minimal name=
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -t|--template)     tpl="${2:?-t needs a template}"; shift 2 ;;
+      -t=*|--template=*) tpl="${1#*=}"; shift ;;
+      -*) die "projects new: unknown flag '$1'" ;;
+      *)  name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: outpost projects new <name> [-t <template>]"
+  scaffold_project "$name" "$tpl"
+  echo "outpost: created project '$name' from template '$tpl' at $PROJECTS_DIR/$name"
+  projects_autocommit "add $name"
+  echo "  edit:  outpost projects edit $name"
+  echo "  build: outpost setup $name"
+}
+
+cmd_projects_edit() {
+  local name="${1:?usage: outpost projects edit <name> [file]}"; shift || true
+  valid_name "$name" || die "invalid project name '$name' (lowercase letters/digits/_/-, max 63)"
+  local pdir="$PROJECTS_DIR/$name"
+  [ -d "$pdir" ] || die "no project '$name' (create it: outpost projects new $name)"
+  local ed; ed="$(pick_editor)" || die "no editor found - set \$EDITOR (e.g. export EDITOR=hx)"
+  local target="$pdir"
+  if [ "$#" -gt 0 ]; then
+    case "$1" in
+      dockerfile|Dockerfile) target="$pdir/Dockerfile" ;;
+      tunnels|tunnels.json)  target="$pdir/tunnels.json" ;;
+      compose|compose.yaml)  target="$pdir/compose.yaml" ;;
+      ports|ports.pin)       target="$pdir/ports.pin" ;;
+      *)                     target="$pdir/$1" ;;
+    esac
+  fi
+  exec $ed "$target"
+}
+
+cmd_projects_ls() {
+  [ -d "$PROJECTS_DIR" ] || die "no projects dir yet ($PROJECTS_DIR). Run: outpost projects init"
+  local have_engine='' p has
+  command -v "$ENGINE" >/dev/null 2>&1 && have_engine=1
+  for p in $(list_projects); do
+    has=""
+    [ -n "$have_engine" ] && { "$ENGINE" container inspect "outpost-$p" >/dev/null 2>&1 && has="container" || has="no container"; }
+    printf '  %-24s %s\n' "$p" "$has"
+  done
+}
+
+cmd_projects_rm() {
+  local destroy='' yes='' name='' arg
+  for arg in "$@"; do
+    case "$arg" in
+      --destroy) destroy=1 ;;
+      -y|--yes)  yes=1 ;;
+      -*) die "projects rm: unknown flag '$arg'" ;;
+      *)  name="$arg" ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: outpost projects rm <name> [--destroy]"
+  # Validate BEFORE building a path we `rm -rf`: an unchecked name (e.g. '../foo')
+  # would let the prompted delete escape OUTPOST_PROJECTS_DIR.
+  valid_name "$name" || die "invalid project name '$name' (lowercase letters/digits/_/-, max 63)"
+  local pdir="$PROJECTS_DIR/$name"
+  [ -d "$pdir" ] || die "no project '$name'"
+  # Removing the config dir makes the project unmanageable (load_project requires it),
+  # so refuse while a container still exists unless --destroy is given - otherwise you
+  # orphan a container outpost can no longer stop/destroy.
+  if [ -z "$destroy" ] && command -v "$ENGINE" >/dev/null 2>&1 \
+     && "$ENGINE" container inspect "outpost-$name" >/dev/null 2>&1; then
+    die "'$name' still has a container; run 'outpost projects rm $name --destroy' (or 'outpost destroy $name' first)"
+  fi
+  # Confirm BEFORE any destructive action: answering 'n' must leave everything intact.
+  # With --destroy the prompt makes clear the container + volumes go too, not just config.
+  if [ -z "$yes" ]; then
+    local what="config dir $pdir"
+    [ -n "$destroy" ] && what="the container, volumes, AND config for '$name'"
+    printf 'outpost: remove %s? [y/N] ' "$what"
+    local ans; read -r ans
+    case "$ans" in y|Y|yes|YES) ;; *) echo "outpost: aborted"; return 0 ;; esac
+  fi
+  if [ -n "$destroy" ]; then need_cmd "$ENGINE"; cmd_destroy "$name"; fi
+  rm -rf "$pdir"
+  echo "outpost: removed config for '$name'"
+  projects_autocommit "remove $name"
+}
+
+cmd_projects_sync() {
+  local msg=
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -m|--message)     msg="${2:?-m needs a message}"; shift 2 ;;
+      -m=*|--message=*) msg="${1#*=}"; shift ;;
+      *) die "projects sync: unknown arg '$1'" ;;
+    esac
+  done
+  need_cmd git
+  projects_is_git || die "projects dir is not a git repo ($PROJECTS_DIR). Run: outpost projects init"
+  if projects_has_origin; then
+    local branch; branch="$(git -C "$PROJECTS_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    if git -C "$PROJECTS_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+      # Upstream already tracked: normal pull.
+      git -C "$PROJECTS_DIR" pull --rebase --autostash \
+        || die "sync: pull failed (resolve conflicts in $PROJECTS_DIR, then re-run)"
+    elif [ -n "$branch" ] && git -C "$PROJECTS_DIR" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+      # First sync against a POPULATED remote: no tracking ref yet, so fetch the branch
+      # and rebase our work on top of it (plain `git pull` would fail with no upstream).
+      git -C "$PROJECTS_DIR" fetch origin "$branch" || die "sync: fetch failed"
+      git -C "$PROJECTS_DIR" rebase --autostash "origin/$branch" \
+        || die "sync: rebase onto origin/$branch failed (resolve in $PROJECTS_DIR, then re-run)"
+    fi
+    # else: empty remote or brand-new branch - nothing to pull; the `push -u` below creates it.
+  fi
+  git -C "$PROJECTS_DIR" add -A
+  if git -C "$PROJECTS_DIR" diff --cached --quiet; then
+    echo "outpost: nothing to commit"
+  else
+    [ -n "$msg" ] || msg="$(projects_auto_message)"
+    git -C "$PROJECTS_DIR" commit -q -m "$msg"
+    echo "outpost: committed: $msg"
+  fi
+  if projects_has_origin; then
+    git -C "$PROJECTS_DIR" push -u origin HEAD && echo "outpost: pushed"
+  else
+    echo "outpost: no 'origin' remote; commit kept locally (set one: outpost projects init --remote <url>)"
+  fi
+}
+
+cmd_projects_templates() {
+  [ -d "$TEMPLATES_DIR" ] || die "no templates dir: $TEMPLATES_DIR"
+  local d; for d in "$TEMPLATES_DIR"/*/; do [ -d "$d" ] && basename "$d"; done
+}
+
+cmd_projects() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    init)             cmd_projects_init "$@" ;;
+    new|create)       cmd_projects_new "$@" ;;
+    edit)             cmd_projects_edit "$@" ;;
+    ls|list)          cmd_projects_ls "$@" ;;
+    rm|remove)        cmd_projects_rm "$@" ;;
+    sync)             cmd_projects_sync "$@" ;;
+    templates)        cmd_projects_templates "$@" ;;
+    path)             echo "$PROJECTS_DIR" ;;
+    ""|-h|--help|help) projects_usage ;;
+    *) projects_usage; exit 1 ;;
+  esac
+}
+
+# Print a shell completion script. `source <(outpost completion bash)` in your rc
+# completes subcommands, `projects` subcommands, and - for project-taking commands -
+# the actual project names (via the existing `outpost ls-projects`). The command lists
+# are baked in from the canonical CMDS/PCMDS constants, not re-typed here.
+cmd_completion() {
+  case "${1:-bash}" in
+    bash) : ;;
+    *) die "completion: only 'bash' is supported (got '${1:-}')" ;;
+  esac
+  # Header interpolates CMDS/PCMDS (only $COMP_* is escaped); the body stays literal.
+  cat <<EOF
+# outpost bash completion. Add to ~/.bashrc:  source <(outpost completion bash)
+_outpost() {
+  local cur cword
+  cur="\${COMP_WORDS[COMP_CWORD]}"; cword=\$COMP_CWORD
+  local cmds="$CMDS"
+  local pcmds="$PCMDS"
+EOF
+  cat <<'BASH'
+  # First-level commands that take a <project> as their next argument.
+  local takes_project=" setup sh update up down ps start stop restart status rm destroy logs cp ports exec "
+  # `projects` subcommands whose next argument is an EXISTING project name (so we
+  # complete it). `new` is excluded: it names a NOT-yet-existing project.
+  local ptakes_project=" edit rm "
+
+  if [ "$cword" -eq 1 ]; then
+    COMPREPLY=( $(compgen -W "$cmds" -- "$cur") ); return
+  fi
+  if [ "${COMP_WORDS[1]}" = projects ]; then
+    if [ "$cword" -eq 2 ]; then
+      COMPREPLY=( $(compgen -W "$pcmds" -- "$cur") )
+    elif [ "$cword" -eq 3 ]; then
+      case "$ptakes_project" in
+        *" ${COMP_WORDS[2]} "*) COMPREPLY=( $(compgen -W "$(outpost ls-projects 2>/dev/null)" -- "$cur") ) ;;
+      esac
+    fi
+    return
+  fi
+  case "$takes_project" in
+    *" ${COMP_WORDS[1]} "*)
+      [ "$cword" -eq 2 ] && COMPREPLY=( $(compgen -W "$(outpost ls-projects 2>/dev/null)" -- "$cur") )
+      ;;
+  esac
+}
+complete -F _outpost outpost
+BASH
+}
+
+# Self-update the tool: fast-forward the OUTPOST_DIR git checkout.
+cmd_upgrade() {
+  need_cmd git
+  [ -d "$OUTPOST_DIR/.git" ] || die "tool dir is not a git checkout: $OUTPOST_DIR"
+  echo "outpost: updating the tool in $OUTPOST_DIR"
+  git -C "$OUTPOST_DIR" pull --ff-only || die "upgrade failed (not a fast-forward). Resolve manually in $OUTPOST_DIR"
+  echo "outpost: updated. Rebuild: outpost base && outpost update --all"
+}
+
+# --- dispatch -----------------------------------------------------------------
+# Canonical command lists - the single source of truth for `outpost completion`, which
+# bakes them into the generated script so completion can never drift from a second copy.
+# Keep in sync with the case arms in main() (CMDS) and cmd_projects() (PCMDS).
+CMDS="base setup sh dash update up down ps start stop restart status rm destroy logs ls cp ports doctor projects exec completion upgrade version"
+PCMDS="init new edit ls rm sync templates path"
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    doctor)            cmd_doctor "$@"; return ;;   # doctor reports a missing engine itself
+    ""|-h|--help|help) usage; return ;;
+    version|--version|-V) echo "outpost $OUTPOST_VERSION"; return ;;
+    projects|project|proj) cmd_projects "$@"; return ;;  # config + git; engine only where needed
+    upgrade|self-update)   cmd_upgrade "$@"; return ;;
+    completion)            cmd_completion "$@"; return ;;  # prints a script; no engine needed
+  esac
+  need_cmd "$ENGINE"
+  case "$cmd" in
+    base)        cmd_base "$@" ;;
+    setup)       cmd_setup "$@" ;;
+    sh)          cmd_sh "$@" ;;
+    exec)        cmd_exec "$@" ;;
+    dash)        cmd_dash "$@" ;;
+    update)      cmd_update "$@" ;;
+    up)          cmd_up "$@" ;;
+    down)        cmd_down "$@" ;;
+    ps)          cmd_ps "$@" ;;
+    start)       cmd_start "$@" ;;
+    stop)        cmd_stop "$@" ;;
+    restart)     cmd_restart "$@" ;;
+    status)      cmd_status "$@" ;;
+    rm)          cmd_rm "$@" ;;
+    destroy)     cmd_destroy "$@" ;;
+    logs)        cmd_logs "$@" ;;
+    ls)          cmd_ls "$@" ;;
+    cp)          cmd_cp "$@" ;;
+    ports)       cmd_ports "$@" ;;
+    ls-projects) list_projects ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+# Run only when executed, not when sourced (tests source this to call functions).
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then main "$@"; fi

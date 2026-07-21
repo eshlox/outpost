@@ -1,0 +1,41 @@
+# Backing services for the fullstack-node example, run on the HOST engine by
+# `outpost up <name>` and reached from the dev container as db:5432 / redis:6379 /
+# mailpit:1025 (same project network). Host-side config, not part of the app repo.
+#
+# NOTE: services are NOT published to a host port. outpost reaches them by name on
+# the project network, and `outpost up`'s lint refuses published host ports (they
+# bypass UFW via Docker's own DNAT rules). Use `expose:` to document each service's
+# port. To open a web UI (e.g. mailpit) in your LAPTOP browser, run the app/tunnel
+# from inside the box, or opt into publishing with OUTPOST_ALLOW_UNSAFE_COMPOSE=1.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    volumes: [db-data:/var/lib/postgresql/data]
+    expose: ["5432"]            # reach from the dev container as db:5432
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "app"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  redis:
+    image: redis:7
+    expose: ["6379"]            # reach from the dev container as redis:6379
+  mailpit:
+    image: axllent/mailpit
+    expose:
+      - "1025"                  # SMTP (app -> mailpit:1025)
+      - "8025"                  # web UI (reach from the dev container as mailpit:8025)
+
+volumes:
+  db-data:
+
+networks:
+  default:
+    # The per-project network outpost creates; `outpost up` ensures it exists and
+    # exports OUTPOST_PROJECT so this name resolves to outpost-<your-project>-net.
+    name: outpost-${OUTPOST_PROJECT}-net
+    external: true

@@ -1,0 +1,9 @@
+# Keep `git archive` (GitHub source tarballs / release zips) lean: drop dev-only and
+# generated paths, so a downloaded tarball is just the tool.
+node_modules/       export-ignore
+docs/node_modules/  export-ignore
+docs/dist/          export-ignore
+docs/.astro/        export-ignore
+.changeset/         export-ignore
+.github/            export-ignore
+tests/              export-ignore

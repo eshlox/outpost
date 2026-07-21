@@ -1,0 +1,11 @@
+# Philosophy: keep lazygit defaults, only add what's missing or fix preferences.
+
+git:
+  autoFetch: false                       # default true — disable the 60s background fetch
+  pagers:                                # default cat — use delta for side-by-side colored diffs
+    - colorArg: always
+      pager: delta --light --paging=never --side-by-side
+
+gui:
+  theme:
+    lightTheme: true                     # default false (dark) — use lazygit's built-in light theme

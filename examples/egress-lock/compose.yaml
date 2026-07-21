@@ -1,0 +1,34 @@
+# Egress-proxy sidecar (approach B in README.md), run on the HOST engine by
+# `outpost up <project>` on the SAME project network as your box (outpost-<project>-net).
+# The box reaches it by name as egress-proxy:8888 and sends all HTTP(S) through it, so a
+# compromised dependency or agent can only talk to the domains in allowlist.filter.
+#
+# HOW TO USE: this is a SNIPPET, not a standalone project. Copy these three files
+# (compose.yaml, tinyproxy.conf, allowlist.filter) INTO your real project dir, beside its
+# Dockerfile. If your project already has a compose.yaml, merge the `egress-proxy` service
+# into it (keep one `services:` and one `networks:` block). The proxy MUST live on your
+# project's network to protect your box - running it in this standalone example dir would
+# put it on outpost-egress-lock-net, which your box is not on.
+#
+# NOTE: not published to a host port (outpost's `up` lint refuses published ports, and it
+# doesn't need one). The bind `source:` paths are relative, so they resolve inside the
+# project dir and pass the compose lint (which refuses host paths outside it).
+#
+# Pick/pin your own tinyproxy image. There is no official one; vet whatever you use and
+# pin it by digest (e.g. image: vimagick/tinyproxy@sha256:...) - the whole point is to
+# reduce trust, so don't trade an unpinned CDN for an unpinned image.
+services:
+  egress-proxy:
+    image: vimagick/tinyproxy:latest   # replace with a digest-pinned, vetted image
+    restart: unless-stopped
+    volumes:
+      - ./tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
+      - ./allowlist.filter:/etc/tinyproxy/filter:ro
+    expose: ["8888"]                   # reach from the box as egress-proxy:8888
+
+networks:
+  default:
+    # The per-project network outpost creates; `outpost up` ensures it exists and exports
+    # OUTPOST_PROJECT so this resolves to outpost-<your-project>-net (the box's network).
+    name: outpost-${OUTPOST_PROJECT}-net
+    external: true

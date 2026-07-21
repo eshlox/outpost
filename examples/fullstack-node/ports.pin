@@ -1,0 +1,8 @@
+# Pin fixed host ports so `ssh -L 3333:localhost:3333 dev-box` keeps working across
+# container restarts (without this, outpost publishes each EXPOSE'd port to a NEW
+# dynamic host port every restart). One container port per line; host port = same,
+# or use "container:host" to remap. Check the live mapping: outpost ports <name>
+3333        # API
+4322        # admin (Vite)
+4323        # web (Astro)
+# 4322:14322  # example remap: container 4322 -> host 14322

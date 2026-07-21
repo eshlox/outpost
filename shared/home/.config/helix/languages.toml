@@ -1,0 +1,27 @@
+# Helix doesn't ship default formatters for these — define them here.
+# (Rust uses rust-analyzer's built-in formatter by default; no entry needed.)
+
+[[language]]
+name = "typescript"
+auto-format = true
+formatter = { command = "prettier", args = ["--parser", "typescript"] }
+
+[[language]]
+name = "tsx"
+auto-format = true
+formatter = { command = "prettier", args = ["--parser", "typescript"] }
+
+[[language]]
+name = "javascript"
+auto-format = true
+formatter = { command = "prettier", args = ["--parser", "babel"] }
+
+[[language]]
+name = "jsx"
+auto-format = true
+formatter = { command = "prettier", args = ["--parser", "babel"] }
+
+[[language]]
+name = "python"
+auto-format = true
+formatter = { command = "black", args = ["-"] }

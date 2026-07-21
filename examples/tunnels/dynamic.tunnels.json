@@ -1,0 +1,6 @@
+{
+  "tunnel": "myproject",
+  "routes": [
+    { "hostname": "myproject.example.dev" }
+  ]
+}

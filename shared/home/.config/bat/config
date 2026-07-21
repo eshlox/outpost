@@ -1,0 +1,15 @@
+# bat (better cat) — config applies whenever you actually install/use it.
+# Bat reads this file from $XDG_CONFIG_HOME/bat/config automatically.
+
+# Catppuccin Latte syntax theme — palette file is at
+# ~/.config/bat/themes/Catppuccin Latte.tmTheme.
+# After first deploy run once:  bat cache --build
+# To list themes:  bat --list-themes
+--theme="Catppuccin Latte"
+
+# Show line numbers + git change markers + the file header, but not the
+# fancy unicode grid (which doubles vertical space). Defaults are noisier.
+--style="numbers,changes,header"
+
+# Always use colors, even when piping (otherwise bat strips them).
+--paging=auto

@@ -1,0 +1,56 @@
+# Shared git defaults (identity/signing live in local.gitconfig, kept separate).
+# Keep git defaults; only override with reason.
+
+[core]
+	# Use Helix even where $EDITOR is not set (GUI clients, cron, etc.)
+	editor = hx
+	# Global ignore for OS / editor junk
+	excludesfile = ~/.gitignore_global
+	# Page diffs through delta for syntax highlighting + side-by-side
+	pager = delta
+
+[init]
+	defaultBranch = main
+
+# Pull = fetch + rebase (default merge produces noisier history)
+[pull]
+	rebase = true
+
+# Auto-prune deleted upstream branches on every fetch
+[fetch]
+	prune = true
+
+# Sort `git branch` by most recent commit, not alphabetically
+[branch]
+	sort = -committerdate
+
+# Sort `git tag` by version (1.10 > 1.9)
+[tag]
+	sort = version:refname
+
+# zdiff3 conflict markers show the common ancestor - easier to resolve
+[merge]
+	conflictStyle = zdiff3
+
+# Remember + reapply conflict resolutions
+[rerere]
+	enabled = true
+
+[column]
+	ui = auto
+
+# Histogram diff is cleaner for refactors than the default Myers
+[diff]
+	algorithm = histogram
+
+# Delta - pretty diff viewer (core.pager + git diff). The Catppuccin Latte
+# syntax-theme needs `bat cache --build` once (outpost-bootstrap-user does this).
+[delta]
+	light            = true
+	side-by-side     = true
+	line-numbers     = true
+	syntax-theme     = Catppuccin Latte
+	navigate         = true
+
+[interactive]
+	diffFilter = delta --color-only

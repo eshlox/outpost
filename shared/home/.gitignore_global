@@ -1,0 +1,36 @@
+# Global gitignore — applies to every repo (referenced by core.excludesfile).
+# Use this for files that are never project-specific: OS junk, editor state,
+# personal scratch files. Project-specific patterns belong in .gitignore.
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+.Trash-*
+
+# Editor / IDE state
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.netrwhist
+.helix/
+
+# Direnv
+.envrc.local
+
+# Personal scratch
+TODO.local
+SCRATCH.md

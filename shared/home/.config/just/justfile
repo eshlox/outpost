@@ -1,0 +1,137 @@
+# Global justfile — populates `j` (fuzzy `just --choose`) with launchers.
+# These recipes are deliberately trivial; the value is having a single picker
+# accessible from any directory, not the wrappers themselves.
+
+# `just` (no args) opens the fuzzy picker
+default:
+    @just --choose
+
+# Open lazygit in $PWD
+lazygit:
+    lazygit
+
+# Open Helix in $PWD (forwards args, e.g. `just hx README.md`)
+hx *args:
+    hx {{args}}
+
+# --- Cloudflare tunnel: per-project, declared in tunnels.json -----------------
+# Each project declares its own tunnel in a tunnels.json that lives BESIDE its
+# Dockerfile on the host (<project>/tunnels.json). outpost mounts that dir
+# read-only at /run/outpost, so these in-container recipes can read it. The model is
+# ONE named tunnel per project (named after the project unless tunnels.json sets
+# "tunnel") with N hostname -> local-port routes - one connector serves them all:
+#
+#   { "routes": [
+#       { "hostname": "web.example.dev",     "port": 4323 },
+#       { "hostname": "api.web.example.dev", "port": 4321 }
+#   ] }
+#
+# A project with no tunnels.json (or no routes) simply has no tunnel.
+#
+# Routes come in two flavours, decided per project by tunnels.json:
+#   FIXED   - every route has a "port": tunnel-setup bakes the hostname->port
+#             ingress into config.yml and `just tunnel` (no args) serves them all.
+#   DYNAMIC - a route omits "port" (one hostname, switchable port). tunnel-setup
+#             only routes the hostname's DNS; you pick the port at run time with
+#             `just tunnel <port>`, serving it ONE port at a time. Handy for a dev
+#             outpost that runs Vite, then Storybook, then a preview on different ports
+#             behind the same stable URL. Don't mix flavours in one tunnels.json.
+tunnels_file := "/run/outpost/tunnels.json"
+
+# Once per project: browser login (account-wide, first time only), then CREATE the
+# project's tunnel if needed, fetch its credentials, point each route's hostname at
+# it (DNS), and write config.yml. Re-runnable; reads tunnels.json each time. For a
+# DYNAMIC project the config carries no ingress - the port is supplied at run time.
+#
+# Create/route the project's tunnel from tunnels.json (run once per project)
+tunnel-setup:
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    f="{{tunnels_file}}"
+    dir="$HOME/.cloudflared"
+    install -d -m 700 "$dir"
+    if [ ! -f "$f" ]; then
+      echo "tunnel-setup: no $f - this project declares no tunnels, nothing to do."
+      echo "  To add one, create $PROJECT/tunnels.json on your projects dir on the HOST (beside the Dockerfile)."
+      exit 0
+    fi
+    n=$(jq '.routes | length' "$f" 2>/dev/null || echo 0)
+    [ "$n" -gt 0 ] || { echo "tunnel-setup: $f declares no routes, nothing to do."; exit 0; }
+    name=$(jq -r '.tunnel // empty' "$f"); [ -n "$name" ] || name="$PROJECT"
+    # DYNAMIC if any route omits its port (one hostname, port chosen at run time).
+    dyn=$(jq '[.routes[] | select(.port == null)] | length' "$f")
+    [ -f "$dir/cert.pem" ] || cloudflared tunnel login
+    uuid=$(cloudflared tunnel list --output json --name "$name" | jq -r '.[0].id // empty')
+    if [ -z "$uuid" ]; then
+      echo "tunnel-setup: creating tunnel '$name'"
+      cloudflared tunnel create "$name" >/dev/null
+      uuid=$(cloudflared tunnel list --output json --name "$name" | jq -r '.[0].id // empty')
+    fi
+    [ -n "$uuid" ] || { echo "tunnel-setup: could not resolve tunnel '$name'." >&2; exit 1; }
+    # Credentials: `create` writes them; fetch them if the tunnel already existed.
+    [ -f "$dir/$uuid.json" ] || cloudflared tunnel token --cred-file "$dir/$uuid.json" "$name" >/dev/null
+    chmod 600 "$dir/$uuid.json"
+    # Point each hostname at THIS tunnel. Idempotent for this tunnel; a benign
+    # failure usually means the DNS record already exists (possibly elsewhere).
+    while read -r host; do
+      [ -n "$host" ] || continue
+      cloudflared tunnel route dns "$name" "$host" >/dev/null 2>&1 \
+        || echo "  note: DNS route for $host not (re)created - it may already exist (possibly on another tunnel)."
+    done < <(jq -r '.routes[].hostname' "$f")
+    if [ "$dyn" -gt 0 ]; then
+      # DYNAMIC: no ingress in the config; `just tunnel <port>` supplies the service.
+      printf 'tunnel: %s\ncredentials-file: %s/%s.json\n' "$uuid" "$dir" "$uuid" >"$dir/config.yml"
+      echo "tunnel-setup: '$name' ready (dynamic). Serve a port with 'just tunnel <port>' (one at a time)."
+      jq -r '.routes[] | "  https://\(.hostname)  ->  http://localhost:<port>"' "$f"
+    else
+      # FIXED: one connector, one ingress rule per route, catch-all 404 last.
+      { printf 'tunnel: %s\ncredentials-file: %s/%s.json\ningress:\n' "$uuid" "$dir" "$uuid"
+        jq -r '.routes[] | "  - hostname: \(.hostname)\n    service: http://localhost:\(.port)"' "$f"
+        printf '  - service: http_status:404\n'
+      } >"$dir/config.yml"
+      echo "tunnel-setup: '$name' ready with $n route(s). Start them with 'just tunnel'."
+      jq -r '.routes[] | "  https://\(.hostname)  ->  http://localhost:\(.port)"' "$f"
+    fi
+    # SECURITY: `cloudflared tunnel login` above wrote ~/.cloudflared/cert.pem - an
+    # ACCOUNT-WIDE credential (create/delete any tunnel + DNS record in your zone)
+    # sitting inside this box, which may run agents full-auto. `just tunnel` only
+    # needs the per-tunnel <uuid>.json, so once your routes are set, drop it:
+    if [ -f "$dir/cert.pem" ]; then
+      echo
+      echo "note: an account-wide Cloudflare credential is now at ~/.cloudflared/cert.pem."
+      echo "  'just tunnel' does NOT need it. Remove it once your routes are set:"
+      echo "    rm ~/.cloudflared/cert.pem"
+      echo "  (re-run 'just tunnel-setup' - it re-logs in - only to add/alter tunnels.)"
+    fi
+
+# Serve this project's tunnel (foreground; Ctrl-C stops). Run it in only ONE outpost at
+# a time, or Cloudflare load-balances across connectors. FIXED projects: `just
+# tunnel` (no args) serves every route from config.yml. DYNAMIC projects: `just
+# tunnel <port>` serves the hostname at that port - ONE port at a time; Ctrl-C and
+# re-run with another port to switch.
+#
+# Serve the tunnel; pass a port for a dynamic project, no args for a fixed one
+tunnel port="":
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    f="{{tunnels_file}}"
+    cfg="$HOME/.cloudflared/config.yml"
+    [ -f "$cfg" ] || { echo "tunnel: run 'just tunnel-setup' first." >&2; exit 1; }
+    dyn=0
+    [ -f "$f" ] && dyn=$(jq '[.routes[] | select(.port == null)] | length' "$f" 2>/dev/null || echo 0)
+    if [ "$dyn" -gt 0 ]; then
+      case "{{port}}" in
+        '')        echo "tunnel: this project's tunnel is dynamic - pass a port: just tunnel <port>" >&2; exit 2 ;;
+        *[!0-9]*)  echo "tunnel: '{{port}}' is not a port number." >&2; exit 2 ;;
+      esac
+      echo "tunnel: serving $PROJECT -> http://localhost:{{port}} (Ctrl-C to stop)."
+      exec cloudflared tunnel --config "$cfg" --url "http://localhost:{{port}}" run
+    else
+      [ -z "{{port}}" ] || { echo "tunnel: this project's routes have fixed ports (set in tunnels.json) - run 'just tunnel' with no port." >&2; exit 2; }
+      echo "tunnel: serving $PROJECT's routes (Ctrl-C to stop)."
+      exec cloudflared tunnel --config "$cfg" run
+    fi
+
+# Ephemeral quick tunnel (random *.trycloudflare.com URL; no setup, any port).
+tunnel-quick port:
+    cloudflared tunnel --url http://localhost:{{port}}

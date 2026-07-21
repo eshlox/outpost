@@ -1,0 +1,31 @@
+# Philosophy: keep Helix defaults, only add what's missing or fix preferences.
+# Each line that overrides a default has a comment showing the default.
+
+theme = "catppuccin_latte"             # ships with Helix — matches the Ghostty terminal theme
+
+[editor]
+line-number = "relative"               # default "absolute" — vim-style relative numbers
+cursorline    = true                   # default false — highlights the current line
+bufferline    = "multiple"             # default "never" — show open buffers as tabs
+color-modes   = true                   # default false — colorize the mode indicator (NOR/INS/SEL)
+true-color    = true                   # default auto-detect — explicit fallback for terminals that lie
+rulers        = [80, 120]              # default [] — visual columns at 80 and 120
+idle-timeout  = 50                     # default 250ms — faster completion / hover popups
+gutters       = ["diagnostics", "line-numbers", "diff"]  # default adds two "spacer" entries; this is more compact
+
+[editor.cursor-shape]
+insert = "bar"                         # default "block" — thin bar in insert mode (matches most editors)
+select = "underline"                   # default "block" — underline in select mode
+
+[editor.lsp]
+display-messages = true                # default false — show LSP status messages (helps debug LSP issues)
+
+[editor.indent-guides]
+render    = true                       # default false — draw vertical lines per indent level
+character = "▏"                        # default "│" — thinner glyph
+
+[editor.soft-wrap]
+enable = true                          # default false — wrap long lines instead of horizontal scroll
+
+[keys.normal]
+"C-r" = ":reload-all"                  # no default — reload all open buffers from disk

@@ -1,0 +1,11 @@
+# Example ~/.ssh/config on your LAPTOP. `dev-box` is just an alias - name it anything;
+# outpost's docs/messages use `dev-box` as the placeholder. Agent forwarding (ForwardAgent
+# / ssh -A) is what lets git inside the container sign + authenticate with your key,
+# WITHOUT the private key ever entering the box (see docs/git-and-ssh.md).
+Host dev-box
+    HostName 100.x.y.z          # your host's Tailscale IP or DNS name
+    User you                    # a host user with uid 1000 (so the container can read the agent)
+    ForwardAgent yes            # forwards your ssh agent (Secretive on macOS, or any agent)
+
+# Then: ssh -A dev-box   ->   outpost sh <project>
+# Reach a dev server published by `outpost ports`:  ssh -A -L 3000:localhost:49xxx dev-box
