@@ -13,7 +13,7 @@
 # (dev-box is just an example ~/.ssh/config host alias - name yours whatever.)
 set -euo pipefail
 
-OUTPOST_VERSION="0.1.0"
+OUTPOST_VERSION="0.2.0"
 
 # --- config file --------------------------------------------------------------
 # Optional per-user config sourced before anything else, so OUTPOST_* settings can

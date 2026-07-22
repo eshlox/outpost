@@ -1,6 +1,6 @@
 {
   "name": "outpost",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "One hardened Docker container per project on a remote host, driven from your terminal.",
   "type": "module",
