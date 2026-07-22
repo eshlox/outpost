@@ -97,6 +97,15 @@ RUN set -eux; u="$(cat /tmp/uarch)"; \
     curl -fSL "https://github.com/casey/just/releases/download/${JUST_VERSION}/just-${JUST_VERSION}-${u}-unknown-linux-musl.tar.gz" -o /tmp/just.tar.gz; \
     tar -xzf /tmp/just.tar.gz -C /usr/local/bin just; rm -f /tmp/just.tar.gz
 
+# herdr (terminal multiplexer for running several coding agents from one session -
+# a natural fit for the box, which is built to run agents). Ships a raw per-arch
+# binary (no tarball); its asset arch names are exactly /tmp/uarch (aarch64/x86_64).
+# Tag has a leading 'v'. Verify with `herdr --version` after `outpost base`.
+ARG HERDR_VERSION=0.7.5
+RUN set -eux; u="$(cat /tmp/uarch)"; \
+    curl -fSL "https://github.com/ogulcancelik/herdr/releases/download/v${HERDR_VERSION}/herdr-linux-${u}" -o /tmp/herdr; \
+    install -m0755 /tmp/herdr /usr/local/bin/herdr; rm -f /tmp/herdr
+
 # GitHub CLI (apt repo).
 RUN set -eux; \
     mkdir -p -m 0755 /etc/apt/keyrings; \
